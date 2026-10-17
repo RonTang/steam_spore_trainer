@@ -58,3 +58,6 @@
 ```bash
 pip install pymem
 python spore_trainer.py
+
+## 感谢
+本修改器使用https://github.com/bvb6417/tkwebui 提供的皮肤，特此感谢
