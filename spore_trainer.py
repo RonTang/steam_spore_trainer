@@ -107,36 +107,96 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Steam版Spore太空阶段修改器")
+        # 内饰底色换成浅蓝白（比 #EDF4FF 更亮白一档，#F4F8FF 几乎白但带一丝蓝）。
+        # 必须在 apply_theme 之前改：tkwebui 的样式表是按 PALETTE 现值烘焙的，
+        # 正文区/输入框/关于弹窗的底色全部随之改变
+        from tkwebui import core as _tkcore
+        _tkcore.PALETTE["bg"] = "#FBFBFF"
         apply_theme(self.root)                  # 创建控件之前调用
         self.root.geometry("640x420")
         self.root.resizable(False, False)       # 需配合打过补丁的 WindowChrome
 
         if sys.platform == "win32":
-            # 自定义标题栏：浅灰工具条与白色内容区形成分界，
-            # 右侧窗口按钮由 WindowChrome 提供
-            toolbar = ttk.Frame(self.root, style="Sidebar.TFrame")
-            toolbar.pack(fill="x")
-            # 用显式颜色的 tk.Label，不依赖 Sidebar.Strong.TLabel 复合样式
-            tk.Label(toolbar, text="Steam版Spore太空阶段修改器",
-                     bg=PALETTE["sidebar"], fg=PALETTE["fg"],
-                     font=("Microsoft YaHei UI", 10, "bold"),
-                     padx=14, pady=10).pack(side="left")
-            ttk.Button(toolbar, text="关于", style="Quiet.TButton", takefocus=False,
-                       command=self.show_about).pack(side="left", padx=(4, 0))
-            # toolbar 整体可拖动（其上的按钮/标签会被自动排除在拖动区外）
-            chrome = WindowChrome(self.root, toolbar, drag_widgets=(toolbar,),
-                                  on_close=self.on_close)
-            # 按钮区背景与工具条同色（库默认 TFrame 是白色补丁）
-            chrome.controls.configure(style="Sidebar.TFrame")
-            # 尺寸锁定：藏掉最大化按钮、禁用双击最大化
-            # （配合打过补丁的库，系统级最大化也已被 ptMaxSize 锁死）
-            chrome.buttons["maximize"].pack_forget()
-            chrome.toggle_maximize = lambda: None
-            # attach 是 after_idle 异步执行的，相关控件可能尚未就绪，轮询等待
-            def _polish_chrome():
+            # 渐变标题栏：Canvas 逐行插值画 蓝→白，底部自然过渡到白色正文区。
+            # 按钮背景 = 其所覆盖区域的渐变切片图（PhotoImage 逐像素合成），
+            # 真按钮也能"透明悬浮"在渐变上。渐变公式抽成 _bar_hex 供两处共用。
+            BAR_H = 68
+            TOP = (0x1E, 0x5B, 0xD6)          # 渐变顶色（深蓝）
+            END = (0xCB, 0xDD, 0xF7)          # 渐变底色：留些蓝，不到纯白
+            toolbar = tk.Canvas(self.root, height=BAR_H, highlightthickness=0,
+                                bd=0, bg="#1E5BD6")
+            toolbar.pack(fill="x", side="top")
+
+            def _bar_hex(y, h):
+                t = min(1.0, max(0.0, y / max(1, h - 1)))
+                r = round(TOP[0] + (END[0] - TOP[0]) * t)
+                g = round(TOP[1] + (END[1] - TOP[1]) * t)
+                b = round(TOP[2] + (END[2] - TOP[2]) * t)
+                return f"#{r:02x}{g:02x}{b:02x}"
+
+            def _paint_bar(event=None):
+                toolbar.delete("bg")
+                w = max(1, toolbar.winfo_width())
+                h = max(1, toolbar.winfo_height())
+                for i in range(h):
+                    toolbar.create_line(0, i, w, i, fill=_bar_hex(i, h), tags="bg")
+                toolbar.tag_lower("bg")
+
+            _paint_bar()
+            toolbar.bind("<Configure>", lambda e: _paint_bar(), add="+")
+
+            # 白色标题，垂直居中偏左
+            toolbar.create_text(
+                18, BAR_H // 2, text="Steam版Spore太空阶段修改器", anchor="w",
+                fill="white", font=("Microsoft YaHei UI", 11, "bold"))
+
+            def _chrome_ready():
+                # ready-to-show：库补丁版由 on_ready 钩子触发（attach 完成
+                # 后再晚一帧）；未补丁库由 after 轮询触发——此守卫两者通用
                 if not chrome.resize_handles:
-                    self.root.after(50, _polish_chrome)
+                    self.root.after(50, _chrome_ready)
                     return
+                # attach 已完成、正文已在屏上（alpha=0 时）绘制完毕：
+                # 1) 完成按钮自绘；2) update_idletasks 把隐藏状态下所有
+                #    待完成的绘制强制收尾；3) 快速淡入——首帧的任何合成
+                #    毛边都藏进渐进显现里
+                _polish_chrome()
+                self.root.update_idletasks()
+                def _fade(step=0, steps=14):
+                    try:
+                        self.root.attributes("-alpha", (step + 1) / steps)
+                    except tk.TclError:
+                        return                        # 窗口已关闭
+                    if step + 1 < steps:
+                        try:
+                            self.root.after(16, _fade, step + 1, steps)
+                        except tk.TclError:
+                            pass
+                _fade()
+
+            try:
+                # 打过补丁的库支持 on_ready：attach 完成时精确触发，无需轮询
+                chrome = WindowChrome(self.root, toolbar, drag_widgets=(toolbar,),
+                                      on_close=self.on_close, on_ready=_chrome_ready)
+            except TypeError:
+                # 未补丁库：退化为轮询
+                chrome = WindowChrome(self.root, toolbar, drag_widgets=(toolbar,),
+                                      on_close=self.on_close)
+                self.root.after(50, _chrome_ready)
+            # 库的 controls 容器（含四枚 ttk 按钮）先藏，_polish 里换自绘、再销毁
+            chrome.controls.pack_forget()
+            # chrome 的 attach 必须等窗口映射后才执行，期间是原生标题栏状态。
+            # 关键：窗口"可见"Windows 才会绘制它——屏外停放会导致正文控件
+            # 从未被画过，首次显示一片黑矩形。所以窗口就放在最终位置（居中），
+            # 用 alpha=0 隐藏：映射/绘制/attach 都正常进行，用户却看不见；
+            # ready 回调里先完成按钮自绘，再把 alpha 归 1，首帧即是成品
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            self.root.geometry(f"640x420+{(sw - 640) // 2}+{(sh - 420) // 2}")
+            self.root.attributes("-alpha", 0.0)
+            # 尺寸锁定：禁用双击最大化
+            # （配合打过补丁的库，系统级最大化也已被 ptMaxSize 锁死）
+            chrome.toggle_maximize = lambda: None
+            def _polish_chrome():
                 # 固定尺寸窗口不需要缩放手柄：手柄是白色长条，
                 # 会盖住标题栏左右两缘（"缺背景色"的真凶）
                 for h in chrome.resize_handles.values():
@@ -150,60 +210,267 @@ class App:
                     _orig_refresh()
                     chrome.resize_margin = 0
                 chrome.refresh_cache = _refresh_keep_margin
-                # 窗口按钮统一换成"标题栏同色底"的平边按钮
-                # （Quiet.TButton 是白色药丸，在灰工具条上很突兀）
+                # 库的 controls 容器是不透明灰框，会挡住渐变——整体弃用
+                chrome.controls.destroy()
+                chrome.paint_control = lambda *a, **k: None   # 按钮已全部自绘
+
                 from tkwebui.core import icon as _icon
 
-                def _flat_button(key, name, hover_bg, hover_color=None):
-                    chrome.buttons[key].pack_forget()
-                    b = tk.Button(chrome.controls, bd=0, highlightthickness=0,
-                                  relief="flat", cursor="hand2",
-                                  bg=PALETTE["sidebar"], activebackground=hover_bg)
-                    state = {"img": None}
-                    def img(color, hov=False):
-                        im = _icon(self.root, name, chrome.icon_size, color=color,
-                                   background=hover_bg if hov else PALETTE["sidebar"])
-                        state["img"] = im   # 防止 PhotoImage 被回收
-                        return im
-                    def refresh(hov=False):
-                        if key == "pin" and chrome.pinned:
-                            color = PALETTE["blue"]
-                        elif hov and hover_color:
-                            color = hover_color
-                        else:
-                            color = PALETTE["muted"]
-                        b.configure(image=img(color, hov))
-                    def cmd():
-                        getattr(chrome, {"pin": "toggle_pin",
-                                         "minimize": "minimize",
-                                         "close": "close"}[key])()
-                        # close 会 destroy 整个窗口（控件甚至整个 Tk 解释器
-                        # 都不复存在），刷新静默跳过即可
-                        try:
-                            refresh()
-                        except tk.TclError:
-                            pass
-                    b.configure(command=cmd)
-                    b.bind("<Enter>", lambda e: refresh(True))
-                    b.bind("<Leave>", lambda e: refresh(False))
-                    refresh()
-                    return b
+                # 统一按钮盒（含 "?"），嵌入画布时强制同尺寸
+                _sc = self.root.winfo_fpixels("1i") / 96
+                BOX = round(34 * _sc)
+                BTN_Y = max(0, (toolbar.winfo_height() - BOX) // 2)
 
-                pin_btn = _flat_button("pin", "pin", PALETTE["hover"])
-                min_btn = _flat_button("minimize", "minimize", PALETTE["hover"])
-                # 关闭按钮：Windows 系统红悬停（#E81123 底 + 白叉）
-                close_btn = _flat_button("close", "close", "#E81123",
-                                         hover_color="#FFFFFF")
-                # 按原顺序排回：置顶 → 最小化 → 关闭（最大化已隐藏）
-                # 四个原始按钮此时已全部 pack_forget，packing 列表为空，
-                # 直接链式 after 排列：置顶 → 最小化 → 关闭
-                pin_btn.pack(side="left", padx=5)
-                min_btn.pack(side="left", padx=5, after=pin_btn)
-                close_btn.pack(side="left", padx=(5, 12), after=min_btn)
-                Tooltip(pin_btn, lambda: "取消置顶" if chrome.pinned else "窗口置顶")
-                Tooltip(min_btn, "最小化")
-                Tooltip(close_btn, "关闭")
-            self.root.after(50, _polish_chrome)
+                def _box_image(color_fn):
+                    """BOX×BOX 底图，color_fn(dy) 给每行颜色。
+                    传 _grad_slice → 与标题栏天衣无缝；传常量 → 悬停底色。"""
+                    img = tk.PhotoImage(width=BOX, height=BOX)
+                    img.put(" ".join("{" + " ".join([color_fn(dy)] * BOX) + "}"
+                                     for dy in range(BOX)))
+                    return img
+
+                _bar_h = max(1, toolbar.winfo_height())
+
+                def _grad_slice(dy):
+                    return _bar_hex(BTN_Y + dy, _bar_h)
+
+                def _shade(hexcolor, f):
+                    """颜色向顶蓝调 f（0~1）"""
+                    rgb = (int(hexcolor[1:3], 16), int(hexcolor[3:5], 16),
+                           int(hexcolor[5:7], 16))
+                    return "#%02x%02x%02x" % tuple(round(c + (t - c) * f)
+                                                  for c, t in zip(rgb, TOP))
+
+                def _press_base():
+                    """按压底图：切片向顶蓝调深 35%，但边缘 3px 内渐隐回原色——
+                    按压感集中在按钮内部，与周围渐变无缝"""
+                    img = tk.PhotoImage(width=BOX, height=BOX)
+                    rows = []
+                    for dy in range(BOX):
+                        base = _grad_slice(dy)
+                        toks = []
+                        for dx in range(BOX):
+                            d = min(dx, BOX - 1 - dx, dy, BOX - 1 - dy)
+                            toks.append(_shade(base, 0.35 * min(1.0, d / 3)))
+                        rows.append("{" + " ".join(toks) + "}")
+                    img.put(" ".join(rows))
+                    return img
+
+                def _press_base_of(kind):
+                    """各按钮的按压底图：关闭按钮用红色系（悬停红的浅版），
+                    其余用蓝渐变的边缘渐隐调深"""
+                    if kind == "close":
+                        return _box_image(lambda dy: "#F06470")
+                    return _press_base()
+
+                _cache = {}
+
+                def _glyph_box(key, color, base_img, off_y=0):
+                    """库图标逐像素合成到底图上。背景键 #FF00FF。
+                    对每个像素算投影系数 s（在 键色→笔画色 连线上的位置），
+                    s 即笔画覆盖率：s≈1 纯笔画、s≈0 纯背景、中间为抗锯齿——
+                    按 s 与底图对应行颜色混合，任意笔画色/底色都无杂边。"""
+                    g = _icon(self.root, key, chrome.icon_size,
+                              color=color, background="#FF00FF")
+                    kx, ky, kz = 255, 0, 255
+                    gr = int(color[1:3], 16); gg = int(color[3:5], 16); gb = int(color[5:7], 16)
+                    dx, dy, dz = gr - kx, gg - ky, gb - kz
+                    den = dx*dx + dy*dy + dz*dz
+                    ox = (BOX - g.width()) // 2
+                    oy = (BOX - g.height()) // 2 + off_y
+                    bg_rows = [base_img.get(0, dy) for dy in range(BOX)]
+                    for x in range(g.width()):
+                        for y in range(g.height()):
+                            c = g.get(x, y)
+                            s = ((c[0]-kx)*dx + (c[1]-ky)*dy + (c[2]-kz)*dz) / den
+                            if s <= 0.03:
+                                continue
+                            br, bg_, bb = bg_rows[oy + y]
+                            if s >= 0.97:
+                                put = color
+                            else:
+                                put = "#%02x%02x%02x" % (round(br + (gr - br) * s),
+                                                         round(bg_ + (gg - bg_) * s),
+                                                         round(bb + (gb - bb) * s))
+                            base_img.put("{" + put + "}", to=(ox + x, oy + y))
+                    return base_img
+
+                # —— 画布原生按钮：不创建任何 tk.Button 控件，四枚按钮统一为
+                #    "图片/文字条目 + 区域命中"，从根上杜绝控件自绘的
+                #    按压边框、下沉残线、假透明 ——
+                B = {}          # kind -> {"show": callable(state)}
+                img_ids = {}    # kind -> 画布图片条目 id
+                b_imgs = {}     # kind -> 当前 PhotoImage（防回收）
+                regions = {}    # kind -> (x0, y0, x1, y1) 命中区域
+                hover = [None]
+                pressed = [None]
+                tip = {"win": None, "job": None}
+
+                def _mk(kind, hover_bg, pinned_aware=False):
+                    def image(state):
+                        ck = (kind, state, pinned_aware and chrome.pinned)
+                        im = _cache.get(ck)
+                        if im is None:
+                            if state == "hover":
+                                im = _glyph_box(kind, "#FFFFFF",
+                                                _box_image(lambda dy: hover_bg))
+                            elif state == "press":
+                                color = ("#E9B44C" if (pinned_aware and chrome.pinned)
+                                         else "#C7D7F8")
+                                im = _glyph_box(kind, color, _press_base_of(kind), off_y=1)
+                            else:
+                                color = ("#F59E0B" if (pinned_aware and chrome.pinned)
+                                         else "#FFFFFF")
+                                im = _glyph_box(kind, color, _box_image(_grad_slice))
+                            _cache[ck] = im
+                        return im
+                    def show(state):
+                        im = image(state)
+                        toolbar.itemconfigure(img_ids[kind], image=im)
+                        b_imgs[kind] = im
+                    item = toolbar.create_image(0, BTN_Y, image=image("normal"),
+                                                anchor="nw")
+                    img_ids[kind] = item
+                    b_imgs[kind] = image("normal")
+                    B[kind] = {"show": show, "hover_bg": hover_bg}
+
+                # "? 关于"：画布文字（真透明）+ 悬停底色矩形条目
+                about_bg = toolbar.create_rectangle(0, 0, 1, 1, fill="#3D78E8",
+                                                    outline="", state="hidden")
+                _about_press_img = _press_base()
+                b_imgs["about_press"] = _about_press_img   # 防 PhotoImage 被 GC
+                about_img = toolbar.create_image(0, 0, image=_about_press_img,
+                                                 anchor="nw", state="hidden")
+                about_item = toolbar.create_text(0, 0, text="?", anchor="center",
+                                                 fill="#FFFFFF",
+                                                 font=("Microsoft YaHei UI", 12, "bold"))
+                about_c = [0, 0]
+
+                def _about_show(state):
+                    cx, cy = about_c
+                    if state == "press":
+                        toolbar.coords(about_item, cx, cy + 1)   # 机械按压：文字下沉
+                        toolbar.itemconfigure(about_item, fill="#C7D7F8")
+                        toolbar.itemconfigure(about_bg, state="hidden")
+                        toolbar.itemconfigure(about_img, state="normal")
+                    elif state == "hover":
+                        toolbar.coords(about_item, cx, cy)
+                        toolbar.itemconfigure(about_item, fill="#FFFFFF")
+                        toolbar.itemconfigure(about_bg, state="normal")
+                        toolbar.itemconfigure(about_img, state="hidden")
+                    else:
+                        toolbar.coords(about_item, cx, cy)
+                        toolbar.itemconfigure(about_item, fill="#FFFFFF")
+                        toolbar.itemconfigure(about_bg, state="hidden")
+                        toolbar.itemconfigure(about_img, state="hidden")
+
+                def _show_state(kind, state):
+                    if kind == "about":
+                        _about_show(state)
+                    elif kind:
+                        B[kind]["show"](state)
+
+                # 预热悬停/按压图（之后状态切换全是换图，无生成延迟）
+                _mk("pin", "#3D78E8", pinned_aware=True)
+                _mk("minimize", "#3D78E8")
+                _mk("close", "#E81123")
+                for k in ("pin", "minimize", "close"):
+                    B[k]["show"]("hover"); B[k]["show"]("press"); B[k]["show"]("normal")
+                _about_show("hover"); _about_show("press"); _about_show("normal")
+
+                def _layout_btns(event=None):
+                    x = toolbar.winfo_width() - 14
+                    for kind in ("close", "minimize", "pin", "about"):  # 从右往左
+                        x -= BOX
+                        regions[kind] = (x, BTN_Y, x + BOX, BTN_Y + BOX)
+                        if kind == "about":
+                            toolbar.coords(about_bg, x, BTN_Y, x + BOX, BTN_Y + BOX)
+                            toolbar.coords(about_img, x, BTN_Y)
+                            about_c[:] = (x + BOX // 2, BTN_Y + BOX // 2)
+                            toolbar.coords(about_item, *about_c)
+                        else:
+                            toolbar.coords(img_ids[kind], x, BTN_Y)
+                        x -= round(4 * _sc)
+                toolbar.bind("<Configure>", lambda e: _layout_btns(), add="+")
+                toolbar.after_idle(_layout_btns)
+
+                # —— 区域命中 + 事件分发 ——
+                TIP_TEXT = {"about": "关于", "minimize": "最小化", "close": "关闭"}
+
+                def _tooltip(kind):
+                    if tip["job"]:
+                        toolbar.after_cancel(tip["job"]); tip["job"] = None
+                    if tip["win"]:
+                        tip["win"].destroy(); tip["win"] = None
+                    if kind is None:
+                        return
+                    def _show():
+                        text = TIP_TEXT.get(kind) or (
+                            "取消置顶" if chrome.pinned else "窗口置顶")
+                        w = tk.Toplevel(toolbar)
+                        w.overrideredirect(True)
+                        w.attributes("-topmost", True)
+                        tk.Label(w, text=text, bg="#333333", fg="#FFFFFF",
+                                 padx=6, pady=2,
+                                 font=("Microsoft YaHei UI", 9)).pack()
+                        x0, y0 = regions[kind][0], regions[kind][1]
+                        w.geometry("+%d+%d" % (
+                            toolbar.winfo_rootx() + x0 + BOX // 2 - 20,
+                            toolbar.winfo_rooty() + y0 + BOX + 8))
+                        tip["win"] = w
+                    tip["job"] = toolbar.after(450, _show)
+
+                def _hit_kind(ev):
+                    for kind, (x0, y0, x1, y1) in regions.items():
+                        if x0 <= ev.x < x1 and y0 <= ev.y < y1:
+                            return kind
+                    return None
+
+                def _on_motion(ev):
+                    k = _hit_kind(ev)
+                    if k != hover[0]:
+                        _show_state(hover[0], "normal")
+                        hover[0] = k
+                        _show_state(k, "hover")
+                        toolbar.configure(cursor="hand2" if k else "")
+                        _tooltip(k)
+
+                def _on_press(ev):
+                    k = _hit_kind(ev)
+                    if k is None:
+                        return chrome.drag(ev)   # 空白处：转发给 WindowChrome 拖动
+                    pressed[0] = k
+                    _tooltip(None)
+                    _show_state(k, "press")
+                    return "break"
+
+                def _on_release(ev):
+                    k = pressed[0]
+                    pressed[0] = None
+                    if k is None:
+                        return None
+                    inside = _hit_kind(ev) == k
+                    if inside:
+                        if k == "about":
+                            self.show_about()
+                        elif k == "pin":
+                            chrome.toggle_pin()
+                        elif k == "minimize":
+                            chrome.minimize()
+                        else:
+                            chrome.close()
+                    try:
+                        _show_state(k, "hover" if inside else "normal")
+                    except tk.TclError:
+                        pass                          # close 后窗口已销毁
+                    hover[0] = k if inside else None
+                    return "break"
+
+                # 注意：不带 add='+' —— 这会替换 WindowChrome 加在 toolbar 上的
+                # 拖动绑定，由 _on_press 自己区分按钮/空白区（空白转发 chrome.drag）
+                toolbar.bind("<ButtonPress-1>", _on_press)
+                toolbar.bind("<ButtonRelease-1>", _on_release)
+                toolbar.bind("<Motion>", _on_motion)
         else:
             # 非 Windows 保留原生标题栏，关于放右上角按钮
             ttk.Button(self.root, text="关于", width=6,
