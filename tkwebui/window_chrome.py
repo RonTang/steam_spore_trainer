@@ -10,6 +10,9 @@ Patched:
 2. WM_GETMINMAXINFO 检测到 Tk 的固定尺寸签名(min==max)时，把 min/max
    track 锁定为当前实际窗口尺寸，修复 resizable(False) 窗口被 Windows
    每次拖动强制撑宽的问题。
+3. on_ready 回调 + <<ChromeReady>> 虚拟事件：attach 全部完成（标题栏已
+   移除、尺寸已校正）后再晚一帧触发，用户此刻 reposition/deiconify 窗口
+   不会有原生标题栏闪现——即内建的 ready-to-show 钩子。
 """
 from __future__ import annotations
 import sys
@@ -19,10 +22,12 @@ from .core import icon, Tooltip, PALETTE
 
 
 class WindowChrome:
-    def __init__(self,root,toolbar,drag_widgets=(),on_close=None,sidebar=None):
+    def __init__(self,root,toolbar,drag_widgets=(),on_close=None,sidebar=None,on_ready=None):
         self.root=root
         root._window_chrome=self
         self.close_action=on_close or getattr(root,'close',root.destroy)
+        self.on_ready=on_ready
+        self._ready_job=None
         self.attached=False
         self._old_proc=None
         self._cache_job=None
@@ -42,7 +47,9 @@ class WindowChrome:
         self.toolbar=toolbar
         self.sidebar=sidebar
         self.drag_widgets=list(drag_widgets)
-        if sys.platform!='win32':return
+        if sys.platform!='win32':
+            if on_ready is not None:root.after_idle(on_ready)
+            return
         import ctypes
         from ctypes import wintypes as w
         self.c,self.w=ctypes,w
@@ -141,6 +148,19 @@ class WindowChrome:
             pass
         self.install_resize_handles()
         self.schedule_cache()
+        # PATCH(3): ready-to-show 钩子。attach 已全部完成（标题栏移除、
+        # 尺寸校正、_fixed_size 已存），再晚一帧让 NCCALCSIZE 等消息落地，
+        # 然后回调 + 虚拟事件——用户此刻 reposition/deiconify 窗口，
+        # 看到的是成品，无原生标题栏闪现。
+        self._ready_job=self.root.after_idle(self._fire_ready)
+
+    def _fire_ready(self):
+        self._ready_job=None
+        if self.on_ready is not None:
+            try:self.on_ready()
+            except Exception:pass
+        try:self.root.event_generate('<<ChromeReady>>')
+        except tk.TclError:pass
 
     def install_resize_handles(self):
         # Tk child HWNDs cover the client edges after WM_NCCALCSIZE removes
@@ -386,13 +406,15 @@ class WindowChrome:
         self.close_action()
 
     def detach(self):
-        if sys.platform!='win32':return
+        if sys.platform!='win32':
+            if on_ready is not None:root.after_idle(on_ready)
+            return
         self.cancel_drag()
         for handle in self.resize_handles.values():
             if handle.winfo_exists():handle.destroy()
         self.resize_handles.clear()
         while self._batch_depth:self.end_update()
-        for job in (self._cache_job,getattr(self,'_attach_job',None)):
+        for job in (self._cache_job,getattr(self,'_attach_job',None),self._ready_job):
             if job is not None:
                 try:self.root.after_cancel(job)
                 except tk.TclError:pass
