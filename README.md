@@ -33,7 +33,8 @@
 - 开关管"锁不锁"，回车管"锁哪个数"
 
 ## 📸 界面预览
-<img width="655" height="430" alt="界面预览" src="https://github.com/user-attachments/assets/fca94dc9-550e-4e68-b15f-6f6e777fe17e" />
+<img width="640" height="450" alt="image" src="https://github.com/user-attachments/assets/8abfe983-91f3-461f-99ac-1d39136f10b9" />
+
 
 
 
