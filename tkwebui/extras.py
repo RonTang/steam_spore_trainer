@@ -4,7 +4,7 @@ import math
 import sys
 import tkinter as tk
 from tkinter import ttk, font as tkfont
-from .core import PALETTE, Card, ScrollArea, Modal, icon, _patch, _raster, _rgb
+from .core import PALETTE, Card, ScrollArea, Modal, icon, _patch, _raster, _rgb, _tp
 
 
 def configure_extra_styles(root, style):
@@ -22,49 +22,8 @@ def configure_extra_styles(root, style):
     def surface(name, normal, states=(), radius=4):
         style.element_create(name, 'image', normal, *states, border=px(radius)+1,
                              width=px(radius)*2+2, height=px(radius)*2+2, sticky='nsew')
-    for name, plain in [('Toggle.TButton', False), ('Toolbutton', True)]:
-        element = 'Web.'+name+'.surface'
-        surface(element, face(c['bg'], c['bg'] if plain else c['border']), [
-            ('disabled selected', face(c['sidebar'], c['border'])),
-            ('disabled', face(c['bg'], c['bg'] if plain else c['border'])),
-            ('pressed', face(c['selected'], c['blue'])),
-            ('selected', face(c['selected'], c['blue'] if not plain else c['selected'])),
-            ('focus', face(c['bg'], c['blue'])),
-            ('active', face(c['hover'], c['hover'] if plain else c['border'])),
-        ])
-        style.layout(name, [(element, {'sticky':'nsew', 'children':[
-            ('Checkbutton.padding', {'sticky':'nsew', 'children':[
-                ('Checkbutton.label', {'sticky':'nsew'})]})]})])
-        style.configure(name, padding=(px(12),px(7)), anchor='center', foreground=c['fg'])
-        style.map(name, foreground=[('disabled',c['disabled']),('selected',c['blue'])])
-    # Compact rectangular switch; square thumb, with state handling kept in ttk.
-    switch_images={}
-    for on in (False,True):
-        for state in ('normal','active','focus','disabled'):
-            width,height=px(40),px(26)
-            track_color=(c['disabled'] if on else '#D9DEE6') if state=='disabled' else (
-                c['accent_hover'] if on and state=='active' else c['accent'] if on else
-                '#858E9C' if state=='active' else '#9B9DA7')
-            def sample(x,y,on=on,state=state,width=width,height=height,track_color=track_color):
-                x=x*40/width;y=y*26/height
-                if state=='focus' and 0.5<=x<=39.5 and 0.5<=y<=25.5:
-                    if x<1.5 or x>38.5 or y<1.5 or y>24.5:return _rgb(c['blue'])
-                if not (3<=x<=37 and 3<=y<=23):return _rgb(c['bg'])
-                left=20 if on else 6
-                if left<=x<=left+14 and 6<=y<=20:
-                    return _rgb('#F7F8FA' if state=='disabled' else '#FFFFFF')
-                return _rgb(track_color)
-            image=_raster(root,width,height,sample)
-            switch_images[on,state]=image;root._tkwebui_images.append(image)
-    style.element_create('Web.SquareSwitch.indicator','image',switch_images[False,'normal'],
-        ('disabled selected',switch_images[True,'disabled']),('disabled',switch_images[False,'disabled']),
-        ('focus selected',switch_images[True,'focus']),('focus',switch_images[False,'focus']),
-        ('active selected',switch_images[True,'active']),('active',switch_images[False,'active']),
-        ('selected',switch_images[True,'normal']),width=px(40),height=px(26),sticky='')
-    style.layout('Square.Switch.TCheckbutton',[('Checkbutton.padding',{'sticky':'nsew','children':[
-        ('Web.SquareSwitch.indicator',{'side':'left'}),('Checkbutton.label',{'side':'left','sticky':'w'})]})])
-    style.configure('Square.Switch.TCheckbutton',background=c['bg'],padding=(0,px(2)),foreground=c['fg'])
-    style.map('Square.Switch.TCheckbutton',background=[('active',c['bg'])],foreground=[('disabled',c['disabled'])])
+    # [启动优化] Toggle.TButton/Toolbutton 样式（~24ms）：本程序未使用，整块删除。
+    # [启动优化] SquareSwitch 8 张位图（~0.17s）：本程序未使用该控件，整段移除。
     for name in ('TMenubutton', 'TOptionMenu'):
         style.layout(name, [('TButton.surface', {'sticky':'nsew','children':[
             ('Menubutton.padding', {'sticky':'nsew','children':[
@@ -89,70 +48,9 @@ def configure_extra_styles(root, style):
     style.configure('TNotebook', background=c['bg'], padding=px(1), tabmargins=(0,0,0,px(7)))
     style.configure('TNotebook.Tab', padding=(px(16),px(8)), foreground=c['muted'])
     style.map('TNotebook.Tab', foreground=[('disabled',c['disabled']),('selected',c['blue'])])
-    # Both sash orientations have a generous hit target and a small visible handle.
-    for orientation in ('Horizontal','Vertical'):
-        horizontal = orientation == 'Horizontal'
-        w,h = (px(36),px(12)) if horizontal else (px(12),px(36))
-        def sample(x,y,w=w,h=h,horizontal=horizontal):
-            long,short = (x,y) if horizontal else (y,x)
-            length,thickness = (w,h) if horizontal else (h,w)
-            center=min(max(long,px(5)),length-px(5))
-            return _rgb('#BFC4CD') if math.hypot(long-center,short-thickness/2)<=max(1,scale) else _rgb(c['bg'])
-        grip=_raster(root,w,h,sample); root._tkwebui_images.append(grip)
-        name='Web.'+orientation+'.Sash.grip'
-        style.element_create(name,'image',grip,width=w,height=h,sticky='')
-        style.layout(orientation+'.Sash',[(name,{'sticky':'ns' if not horizontal else 'ew'})])
-    style.configure('Sash',sashthickness=px(12),gripcount=0)
-    # Round and compact-bar slider variants share native ttk Scale behavior.
-    for orient in ('Horizontal','Vertical'):
-        horizontal=orient=='Horizontal'
-        w,h=(px(128),px(24)) if horizontal else (px(24),px(128))
-        def track(x,y,w=w,h=h,horizontal=horizontal):
-            long,short=(x,y) if horizontal else (y,x)
-            length,thickness=(w,h) if horizontal else (h,w)
-            center=min(max(long,px(12)),length-px(12))
-            return _rgb(c['hover']) if math.hypot(long-center,short-thickness/2)<=px(2) else _rgb(c['bg'])
-        image=_raster(root,w,h,track); root._tkwebui_images.append(image)
-        track_name='Web.'+orient+'.Scale.trough'
-        style.element_create(track_name,'image',image,border=(px(12),0) if horizontal else (0,px(12)),
-                             width=px(24),height=px(24),sticky='nsew')
-        for variant in ('','Tick.'):
-            images=[]
-            size=px(24)
-            for edge,fill in [(c['border'],c['bg']),(c['blue'],c['bg']),(c['disabled'],c['sidebar'])]:
-                def thumb(x,y,edge=edge,fill=fill,variant=variant,size=size,horizontal=horizontal):
-                    cx,cy=size/2,size/2
-                    if variant:
-                        a,b=(x,y) if horizontal else (y,x)
-                        nearest=min(max(b,cy-px(5)),cy+px(5))
-                        distance=math.hypot(a-cx,b-nearest)
-                        return _rgb(edge if edge==c['disabled'] else c['blue']) if distance<=px(2) else _rgb(c['bg'])
-                    d=math.hypot(x-cx,y-cy)
-                    return _rgb(fill) if d<px(7)-1 else _rgb(edge) if d<=px(7) else _rgb(c['bg'])
-                im=_raster(root,size,size,thumb,transparent=_rgb(c['bg']) if variant else None)
-                if not variant:
-                    for yy in range(size):
-                        for xx in range(size):
-                            if math.hypot(xx+.5-size/2,yy+.5-size/2)>px(7)+1:
-                                im.transparency_set(xx,yy,True)
-                root._tkwebui_images.append(im);images.append(im)
-            slider_name='Web.'+orient+'.'+variant+'Scale.slider'
-            style.element_create(slider_name,'image',images[0],('disabled',images[2]),('pressed',images[1]),('active',images[1]),('focus',images[1]),width=size,height=size,sticky='')
-            name=orient+'.'+variant+'TScale'
-            style.layout(name,[(track_name,{'sticky':'ew' if horizontal else 'ns','children':[
-                (slider_name,{'side':'left' if horizontal else 'top','sticky':''})]})])
-            style.configure(name,background=c['bg'],borderwidth=0)
-        # Small-radius progress surfaces, horizontal and vertical.
-        for part,color in [('trough',c['hover']),('pbar',c['accent'])]:
-            width,height=(px(128),px(7)) if horizontal else (px(7),px(128))
-            im=_patch(root,color,color,c['bg'],px(2),width=width,height=height)
-            root._tkwebui_images.append(im)
-            element='Web.'+orient+'.Progress.'+part
-            style.element_create(element,'image',im,border=px(2),width=px(7),height=px(7),sticky='nsew')
-        style.layout(orient+'.TProgressbar', [('Progressbar.padding',{'sticky':'nsew','children':[
-            ('Web.'+orient+'.Progress.trough',{'sticky':'ew' if horizontal else 'ns','children':[
-                ('Web.'+orient+'.Progress.pbar',{'side':'left' if horizontal else 'bottom','sticky':'ns' if horizontal else 'ew'})]})]})])
-        style.configure(orient+'.TProgressbar',background=c['bg'],thickness=px(7),borderwidth=0,padding=(px(14),0) if horizontal else (0,px(14)))
+    # [启动优化] Sash grip 位图（~0.08s）：本程序未使用 Panedwindow，整段移除。
+    # [启动优化] Scale 轨道/滑块/Progress 位图（~0.5s）：本程序未使用这些控件，整段移除。
+    # 若将来需要，从备份的 extras.py 恢复这三段即可。
     blank=tk.PhotoImage(master=root,width=px(16),height=px(16));root._tkwebui_images.append(blank)
     style.element_create('Web.Tree.indicator','image',icon(root,'chevronright',px(13)),('user2',blank),('user1',icon(root,'chevrondown',px(13))),width=px(24),sticky='')
     style.layout('Treeview.Item',[('Treeitem.padding',{'sticky':'nsew','children':[
@@ -510,7 +408,6 @@ class MenuPopup(tk.Toplevel):
         return 'break'
     def destroy(self):self.close()
 
-
 class PlaceholderEntry(ttk.Entry):
     """ttk.Entry with a muted placeholder. get() returns '' while the placeholder is shown."""
     def __init__(self, master=None, placeholder='', **kwargs):
@@ -556,3 +453,4 @@ class PlaceholderEntry(ttk.Entry):
     def delete(self, first, last=None):
         self._hide()
         return ttk.Entry.delete(self, first, last)   # 继续执行，语义落地
+
