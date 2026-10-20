@@ -6,11 +6,15 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-import pymem
-from pymem.process import module_from_name
-
 from tkwebui import (enable_dpi_awareness, apply_theme, Tooltip,
                      PlaceholderEntry, Modal, WindowChrome, PALETTE)
+
+
+# [启动优化] 本程序未使用 forms 的任何控件（MessageDialog/Badge/DateEntry 等），
+# 其语义色按钮样式生成（~0.1s）直接跳过。core.py 在 apply_theme 内是延迟导入，
+# 会读到这里替换后的 no-op。若将来用到 forms，删掉这两行即可。
+import tkwebui.forms as _tkforms
+_tkforms.configure_form_styles = lambda root, style: None
 
 enable_dpi_awareness()   # 必须在创建 Tk() 之前调用，高分屏不发虚
 
@@ -86,7 +90,7 @@ def _fill_wrap(text, max_px, font):
     lines.append(cur)
     return "\n".join(lines)
 
-def resolve(pm, cfg):
+def resolve(pm, cfg, module_from_name):
     base = module_from_name(pm.process_handle, PROCESS_NAME).lpBaseOfDll
     addr = base + cfg["module_offset"]
     for off in cfg["offsets"]:
@@ -650,6 +654,8 @@ class App:
             self.lock_target[name] = target
 
     def worker(self):
+        import pymem                              # [启动优化] 延迟到后台线程 import，
+        from pymem.process import module_from_name   # 窗口先弹出，pymem 在后台加载
         pm = None
         while self.running:
             # 1) 消费 UI 指令（纯 Python 数据结构，安全）
@@ -676,7 +682,7 @@ class App:
                 if not self.running:
                     break
                 try:
-                    addr = resolve(pm, cfg)
+                    addr = resolve(pm, cfg, module_from_name)
                     cur = read_val(pm, cfg, addr)
                     self.set_cur(name,
                                  f"{cur:.2f}" if cfg["is_float"] else str(cur))
