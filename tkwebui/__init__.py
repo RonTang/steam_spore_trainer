@@ -13,16 +13,17 @@ apply_theme(root) before creating widgets:
 Every component can also be imported from its own module, e.g.
 ``from tkwebui.charts import LineChart``.
 """
-__version__ = '0.1.0'
+__version__ = '0.3.0'
 
 from .scrolling import AutoScrollbar
+from .placeholder import set_placeholder, PlaceholderEntry
 from .core import (PALETTE, THEME, enable_dpi_awareness, icon, apply_theme, Card, SegmentedControl,
                    Sidebar, ScrollArea, Tooltip, Dropdown, Accordion, SettingRow, BarChart, CardList,
                    ProgressSlider, Modal)
 from .widgets import (RoundedText, SectionCard, ResponsiveTable, configure_table, auto_hide_text_scrollbar,
                       focus_when_mapped, initial_window_bounds, align_tree_scrollbar)
 from .popups import ChoicePopup, ThemedCombobox, ThemedMenu
-from .extras import SquareSwitch, ToggleButton, ToolButton, MenuButton, OptionMenu, RoundedListbox,PlaceholderEntry
+from .extras import SquareSwitch, ToggleButton, ToolButton, MenuButton, OptionMenu, RoundedListbox
 from .table import SortableTreeview, enable_sorting, Spreadsheet
 from .charts import LineChart, ColumnChart, ScatterChart, DonutChart, PieChart
 from .forms import (Badge, ValidatedEntry, ResultDialog, MessageDialog, InputDialog, Dialogs, DateEntry,
@@ -33,7 +34,7 @@ from .media import ColorPicker, ColorDialog, FontPicker, FontDialog, ImageViewer
 from .window_chrome import WindowChrome
 
 __all__ = [
-    'AutoScrollbar',
+    'AutoScrollbar', 'set_placeholder', 'PlaceholderEntry',
     'PALETTE', 'THEME', 'enable_dpi_awareness', 'icon', 'apply_theme',
     'Card', 'SegmentedControl', 'Sidebar', 'ScrollArea', 'Tooltip', 'Dropdown', 'Accordion', 'SettingRow',
     'BarChart', 'CardList', 'ProgressSlider', 'Modal',

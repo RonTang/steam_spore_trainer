@@ -8,20 +8,9 @@ from __future__ import annotations
 import math
 import sys
 import tkinter as tk
+from functools import lru_cache
 from tkinter import font as tkfont, ttk
-
-import os as _os
-import time as _ptime
-_TKWEBUI_PROFILE = bool(_os.environ.get('TKWEBUI_PROFILE'))
-_profile_t0 = _ptime.perf_counter()
-_tp_last = [_ptime.perf_counter()]
-def _tp(msg):
-    """apply_theme 分段计时：仅当环境变量 TKWEBUI_PROFILE=1 时打印。"""
-    global _tp_last
-    now = _ptime.perf_counter()
-    if _TKWEBUI_PROFILE:
-        print(f'[tkwebui] {now - _profile_t0:.3f}s  (+{now - _tp_last[0]:.3f}s)  {msg}', flush=True)
-    _tp_last[0] = now
+from .tcl_bridge import unbind
 
 PALETTE = dict(bg='#FFFFFF', sidebar='#F5F5F7', fg='#16181D', muted='#697180',
                border='#E1E2E8', hover='#F1F1F4', active='#E5E5EB',
@@ -40,7 +29,9 @@ def enable_dpi_awareness():
             except (AttributeError, OSError): pass
 
 
+@lru_cache(maxsize=256)
 def _rgb(color):
+    # Raster samplers call this once per subsample with a handful of colors.
     return tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
 
 
@@ -48,21 +39,8 @@ def _blend(colors):
     return '#' + ''.join(f'{round(sum(c[i] for c in colors)/len(colors)):02x}' for i in range(3))
 
 
-_KNOWN_FONTS = ('Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI', 'SimHei',
-                'PingFang SC', 'Helvetica Neue', 'Arial')
-
-_FAMILIES_CACHE = None
-def _families_cached(root):
-    global _FAMILIES_CACHE
-    if _FAMILIES_CACHE is None:
-        _FAMILIES_CACHE = tkfont.families(root)
-    return _FAMILIES_CACHE
-
-
 def _patch(root, fill, border, surrounding, radius, height=80, width=192):
     # Broad centers avoid thousands of tiny image tiles during a resize.
-    # 注意：默认尺寸 80x192 不能缩小——ttk image element 的 border 切片
-    # 依赖足够大的图源，太小会导致输入框边框/窗口元素渲染不全。
     width, height = max(width, radius*2+4), max(height, radius*2+4)
     image = tk.PhotoImage(master=root, width=width, height=height)
     image.put(fill, to=(0, 0, width, height))
@@ -70,57 +48,68 @@ def _patch(root, fill, border, surrounding, radius, height=80, width=192):
                  (0,radius,1,height-radius), (width-1,radius,width,height-radius)):
         image.put(border, to=rect)
     rgb_fill, rgb_border, rgb_bg = map(_rgb, (fill,border,surrounding))
-    # 圆角逐行构建整行像素串、每行一次 put：调用次数从 O(radius^2) 降到 2*radius。
-    # 关键：只有最外一行（y==0）的中间段是 border（上下横线），其余圆角行
-    # 的中间段是 fill——否则会把输入框等的上下边框线盖掉。
-    middle_fill = ' '.join([fill] * (width - 2 * radius))
-    middle_border = ' '.join([border] * (width - 2 * radius))
+    # Four bulk corner writes instead of one Tcl call per corner pixel.
+    corner = []
     for y in range(radius):
-        cells = []
+        row = []
         for x in range(radius):
             samples = []
             for dx,dy in ((.25,.25),(.75,.25),(.25,.75),(.75,.75)):
-                distance = math.hypot(x+dx-radius, y+dy-radius)
+                distance = math.hypot(x+dx-radius,y+dy-radius)
                 samples.append(rgb_fill if distance <= radius-1 else rgb_border if distance <= radius else rgb_bg)
-            cells.append(_blend(samples))
-        left = ' '.join(cells)
-        right = ' '.join(reversed(cells))
-        middle = middle_border if y == 0 else middle_fill
-        image.put('{' + left + ' ' + middle + ' ' + right + '}', to=(0, y))
-        image.put('{' + left + ' ' + middle + ' ' + right + '}', to=(0, height - 1 - y))
+            row.append(_blend(samples))
+        corner.append(row)
+    for right,bottom in ((False,False),(True,False),(False,True),(True,True)):
+        rows = list(reversed(corner)) if bottom else corner
+        data = ' '.join('{'+' '.join(reversed(row) if right else row)+'}' for row in rows)
+        if radius:image.put(data, to=(width-radius if right else 0, height-radius if bottom else 0))
     return image
 
 
-def _raster(root, width, height, sample, transparent=None):
-    # 启动性能（关键修复）：逐像素采样后直接在 Python 侧打包 RGBA PNG，
-    # 交给 Tk 原生解码。旧实现把几万像素拼成巨型字符串走 image.put（字符串
-    # 传输 + Tcl 解析），需要透明时还要逐像素 transparency_set——两者都是
-    # 跨解释器开销，是 apply_theme ~0.8s 热点的根因。透明像素改为直接写
-    # alpha 通道。模式与库内 _round_thumb 相同（zlib/struct 均为标准库）。
-    import struct, zlib
-    raw = bytearray()
+def _raster(root, width, height, sample, transparent=None, outside=None):
+    from .render import _png
+    # One RGBA PNG instead of a hex-string put plus a transparency_set call per
+    # background pixel; uniform 2x2 samples (most pixels) skip the averaging.
+    # ``outside(x, y)`` optionally marks further pixels as fully transparent.
+    transparent = tuple(transparent) if transparent is not None else None
+    rgba = bytearray()
     for y in range(height):
-        raw.append(0)                       # PNG 每行滤波器类型 0（无滤波）
         for x in range(width):
-            # 纯整数累加，4 采样求均值：不在热路径走 _blend/_rgb 的
-            # hex 字符串格式化（那是逐像素采样阶段的真正大头）。
-            r0 = g0 = b0 = 0
-            for dx, dy in ((.25, .25), (.75, .25), (.25, .75), (.75, .75)):
-                sr, sg, sb = sample(x + dx, y + dy)
-                r0 += sr; g0 += sg; b0 += sb
-            r, g, b = (r0 + 2) >> 2, (g0 + 2) >> 2, (b0 + 2) >> 2
-            if transparent is not None and (r, g, b) == transparent:
-                raw.extend((r, g, b, 0))
-            else:
-                raw.extend((r, g, b, 255))
-    def chunk(kind, data):
-        return struct.pack('!I', len(data)) + kind + data + \
-               struct.pack('!I', zlib.crc32(kind + data) & 0xffffffff)
-    png = (b'\x89PNG\r\n\x1a\n'
-           + chunk(b'IHDR', struct.pack('!2I5B', width, height, 8, 6, 0, 0, 0))
-           + chunk(b'IDAT', zlib.compress(bytes(raw)))
-           + chunk(b'IEND', b''))
-    return tk.PhotoImage(master=root, data=png, format='png')
+            a,b,c,d = [sample(x+dx,y+dy) for dx,dy in ((.25,.25),(.75,.25),(.25,.75),(.75,.75))]
+            pixel = tuple(a) if a==b==c==d else tuple(round((a[i]+b[i]+c[i]+d[i])/4) for i in range(3))
+            rgba.extend(pixel); rgba.append(0 if pixel==transparent or (outside and outside(x,y)) else 255)
+    return tk.PhotoImage(master=root, data=_png(width,height,bytes(rgba)), format='png')
+
+
+_ICON_HITS={}  # (name, size) -> per-pixel count of 2x2 samples on a stroke
+
+
+def _icon_hits(shapes, size):
+    """2x2 supersampled stroke hits of a 20-unit line icon at ``size`` pixels.
+
+    Same per-sample test as before, but each stroke only tests the samples
+    within its reach; samples elsewhere cannot hit it.
+    """
+    segments,circles,dots=shapes
+    hit=bytearray(size*size*4)
+    offsets=((.25,.25),(.75,.25),(.25,.75),(.75,.75))
+    def visit(left,top,right,bottom,inside):
+        for y in range(max(0,int(top*size/20)-1),min(size,int(bottom*size/20)+2)):
+            for x in range(max(0,int(left*size/20)-1),min(size,int(right*size/20)+2)):
+                base=(y*size+x)*4
+                for i,(dx,dy) in enumerate(offsets):
+                    if not hit[base+i] and inside((x+dx)*20/size,(y+dy)*20/size):hit[base+i]=1
+    for (ax,ay),(bx,by) in segments:
+        vx,vy=bx-ax,by-ay;length=vx*vx+vy*vy or 1
+        def segment(x,y,ax=ax,ay=ay,vx=vx,vy=vy,length=length):
+            t=max(0,min(1,((x-ax)*vx+(y-ay)*vy)/length))
+            return math.hypot(x-ax-t*vx,y-ay-t*vy)<.8
+        visit(min(ax,bx)-.8,min(ay,by)-.8,max(ax,bx)+.8,max(ay,by)+.8,segment)
+    for cx,cy,r in circles:
+        visit(cx-r-.8,cy-r-.8,cx+r+.8,cy+r+.8,lambda x,y,cx=cx,cy=cy,r=r:abs(math.hypot(x-cx,y-cy)-r)<.8)
+    for cx,cy in dots:
+        visit(cx-1.25,cy-1.25,cx+1.25,cy+1.25,lambda x,y,cx=cx,cy=cy:math.hypot(x-cx,y-cy)<1.25)
+    return bytes(sum(hit[i:i+4]) for i in range(0,len(hit),4))
 
 
 def icon(root, name, size=20, color=None, background=None):
@@ -159,18 +148,19 @@ def icon(root, name, size=20, color=None, background=None):
              'settings':[(7,5,2),(13,10,2),(8,15,2)],'info':[(10,10,8)]}
     dots={'more':[(4,10),(10,10),(16,10)],'info':[(10,6)]}
     if name=='info':paths['info']=[[(10,9),(10,14)]]
+    from .render import _png
     foreground,bg=map(_rgb,(color,background))
-    def distance(x,y,a,b):
-        ax,ay=a;bx,by=b;vx,vy=bx-ax,by-ay
-        t=max(0,min(1,((x-ax)*vx+(y-ay)*vy)/(vx*vx+vy*vy or 1)))
-        return math.hypot(x-ax-t*vx,y-ay-t*vy)
-    def sample(x,y):
-        x,y=x*20/size,y*20/size
-        hit=any(distance(x,y,a,b)<.8 for path in paths.get(name,[]) for a,b in zip(path,path[1:]))
-        hit=hit or any(abs(math.hypot(x-cx,y-cy)-r)<.8 for cx,cy,r in circles.get(name,[]))
-        hit=hit or any(math.hypot(x-cx,y-cy)<1.25 for cx,cy in dots.get(name,[]))
-        return foreground if hit else bg
-    cache[key]=_raster(root,size,size,sample,transparent=bg)
+    hits=_ICON_HITS.get((name,size))
+    if hits is None:
+        shapes=([(a,b) for path in paths.get(name,[]) for a,b in zip(path,path[1:])],circles.get(name,[]),dots.get(name,[]))
+        hits=_ICON_HITS[(name,size)]=_icon_hits(shapes,size)
+    # Same pixels as _raster(): k of 4 samples hit -> rounded fg/bg mix, and
+    # pixels equal to the background are transparent.
+    table=[]
+    for k in range(5):
+        pixel=foreground if k==4 else bg if k==0 else tuple(round((k*f+(4-k)*b)/4) for f,b in zip(foreground,bg))
+        table.append(bytes(pixel)+(b'\0' if pixel==bg else b'\xff'))
+    cache[key]=tk.PhotoImage(master=root,data=_png(size,size,b''.join(table[k] for k in hits)),format='png')
     return cache[key]
 
 
@@ -184,7 +174,9 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
     scale=root.winfo_fpixels('1i')/96
     px=lambda n:max(1,round(n*scale))
     root.tk.call('tk','scaling',root.winfo_fpixels('1i')/72)
-    if font_family not in _KNOWN_FONTS and font_family not in _families_cached(root):font_family=tkfont.nametofont('TkDefaultFont').actual('family')
+    # Resolving one font is instant; tkfont.families() enumerates every
+    # installed font (up to ~1 s on a cold Windows start).
+    if tkfont.Font(root=root,family=font_family).actual('family')!=font_family:font_family=tkfont.nametofont('TkDefaultFont').actual('family')
     for name in ('TkDefaultFont','TkTextFont','TkMenuFont','TkHeadingFont','TkCaptionFont','TkTooltipFont'):
         tkfont.nametofont(name,root=root).configure(family=font_family,size=font_size)
     normal=(font_family,font_size);bold=(font_family,font_size,'bold');small=(font_family,max(9,font_size-1))
@@ -192,19 +184,22 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
     style=ttk.Style(root)
     if THEME not in style.theme_names():style.theme_create(THEME,parent='clam')
     style.theme_use(THEME)
-    _tp('A 字体设置+theme_use')
     style.configure('.',background=c['bg'],foreground=c['fg'],font=normal,bordercolor=c['border'],
                     lightcolor=c['bg'],darkcolor=c['bg'],troughcolor=c['hover'])
     style.map('.',foreground=[('disabled',c['disabled'])])
     root.configure(background=c['bg'])
-    root.option_add('*Font','TkDefaultFont')
+    # Classic widget classes only. A bare '*Font' is also read by ttk.Label /
+    # ttk.Entry, whose explicit -font then overrides every style font
+    # (Strong.TLabel, Muted.TLabel, section titles ...).
+    for widget in ('Label','Button','Checkbutton','Radiobutton','Menubutton','Message','Labelframe',
+                   'Scale','Text','Entry','Spinbox','Listbox'):
+        root.option_add(f'*{widget}.Font','TkDefaultFont')
     for widget in ('Text','Listbox','Canvas','Menu'):
         root.option_add(f'*{widget}.background',c['bg'])
     for widget in ('Text','Listbox','Menu'):
         root.option_add(f'*{widget}.foreground',c['fg'])
         root.option_add(f'*{widget}.selectBackground',c['selected'])
         root.option_add(f'*{widget}.selectForeground',c['fg'])
-    _tp('B 基础configure+option_add')
     root._tkwebui_images=[]
     patch_cache={}
     def face(fill,border,background,radius=4,height=80):
@@ -222,7 +217,6 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
         for suffix,fg,font in [('TLabel',c['fg'],normal),('Muted.TLabel',c['muted'],small),('Strong.TLabel',c['fg'],bold)]:
             style.configure(prefix+suffix,background=bg,foreground=fg,font=font)
     style.configure('Blue.TLabel',foreground=c['blue'],background=c['selected'])
-    _tp('C Frame/Label样式')
     for name,fill,border in [('Card.TFrame',c['bg'],c['border']),('Selected.Card.TFrame',c['selected'],c['blue']),('Segment.Card.TFrame',c['hover'],c['hover'])]:
         elem=name+'.surface'
         element(elem,face(fill,border,c['bg'],5,128),radius=5,content_padding=px(5)+1)
@@ -230,12 +224,16 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
         style.configure(name,background=fill)
     element('Selected.Logo.surface',face(c['bg'],c['border'],c['selected'],5,128),radius=5)
     style.layout('Selected.Logo.TFrame',[('Selected.Logo.surface',{'sticky':'nsew'})])
-    # [启动优化] 只保留本程序用到的按钮样式（Modal 的确定/取消/关闭）；
-    # Nav/Segment/Close/CardIcon 未使用，整组删除（省 13 张 _patch 图）
     definitions=[
         ('TButton',c['bg'],c['border'],c['hover'],c['fg'],c['bg']),
         ('Primary.TButton',c['accent'],c['accent'],c['accent_hover'],'#FFFFFF',c['bg']),
         ('Quiet.TButton',c['bg'],c['bg'],c['hover'],c['muted'],c['bg']),
+        ('Close.TButton',c['bg'],c['bg'],'#FFE8E8',c['muted'],c['bg']),
+        ('CardIcon.TButton',c['selected'],c['selected'],'#DCEBFE',c['muted'],c['selected']),
+        ('Nav.TButton',c['sidebar'],c['sidebar'],c['active'],c['fg'],c['sidebar']),
+        ('Selected.Nav.TButton',c['active'],c['active'],c['active'],c['fg'],c['sidebar']),
+        ('Segment.TButton',c['hover'],c['hover'],c['active'],c['muted'],c['hover']),
+        ('Selected.Segment.TButton',c['bg'],c['bg'],c['bg'],c['blue'],c['hover']),
     ]
     for name,fill,border,hover,fg,surround in definitions:
         elem=name+'.surface'
@@ -246,10 +244,24 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
             ('Button.padding',{'sticky':'nsew','children':[('Button.label',{'sticky':'nsew'})]})]})])
         style.configure(name,foreground=fg,padding=(px(12),px(6)),font=normal,anchor='center')
         style.map(name,foreground=[('disabled',c['disabled'])])
-    _tp('D 按钮样式大循环')
-    style.configure('Quiet.TButton',padding=px(5))
+    for name in ('Nav.TButton','Selected.Nav.TButton'):
+        style.configure(name,anchor='w',padding=(px(10),px(8)))
+    for name in ('Quiet.TButton','CardIcon.TButton','Close.TButton'):style.configure(name,padding=px(5))
+    style.configure('Dropdown.TButton',anchor='w')
+    # Fixed width leaves a gap before the label; sticky 'e' keeps the chevron
+    # from being tiled when a layout stretches the element vertically.
     style.element_create('Switch.Dropdown.arrow','image',icon(root,'chevrondown',px(13)),
-                         ('disabled',icon(root,'chevrondown',px(13),color=c['disabled'])))
+                         ('disabled',icon(root,'chevrondown',px(13),color=c['disabled'])),width=px(13)+px(8),sticky='e')
+    style.layout('Dropdown.TButton',[('TButton.surface',{'sticky':'nsew','children':[
+        ('Button.padding',{'sticky':'nsew','children':[
+            ('Switch.Dropdown.arrow',{'side':'right','sticky':''}),
+            ('Button.label',{'side':'left','sticky':'nsew','expand':True})]})]})])
+    style.configure('Popup.Quiet.TButton',anchor='w',padding=(px(12),px(8)))
+    for selected in (False,True):
+        source='Selected.Nav.TButton' if selected else 'Nav.TButton'
+        name='Selected.Icon.Nav.TButton' if selected else 'Icon.Nav.TButton'
+        style.layout(name,style.layout(source))
+        style.configure(name,anchor='center',padding=(px(4),px(8)))
     # Native C-drawn controls; recolor only the small surfaces that need it.
     entry_face='Switch.Entry.field'
     element(entry_face,face(c['bg'],c['border'],c['bg'],3),[
@@ -264,6 +276,15 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
         style.configure(name,padding=px(6),fieldbackground=c['bg'],background=c['bg'],
                         arrowcolor=c['muted'],arrowsize=px(12),borderwidth=1)
         style.map(name,fieldbackground=[('readonly',c['bg'])],bordercolor=[('focus',c['blue'])])
+    for direction,symbol in [('up','chevronup'),('down','chevrondown')]:
+        style.element_create('Switch.Spinbox.'+direction+'arrow','image',icon(root,symbol,px(9)),
+                             ('disabled',icon(root,symbol,px(9),color=c['disabled'])),
+                             width=px(22),height=px(14),sticky='')
+    style.layout('TSpinbox',[(entry_face,{'sticky':'nsew','children':[
+        ('null',{'side':'right','sticky':'ns','children':[
+            ('Switch.Spinbox.uparrow',{'side':'top','sticky':'e'}),
+            ('Switch.Spinbox.downarrow',{'side':'bottom','sticky':'e'})]}),
+        ('Spinbox.padding',{'sticky':'nsew','children':[('Spinbox.textarea',{'sticky':'nsew'})]})]})])
     for widget in ('Checkbutton','Radiobutton'):
         if 'vista' in style.theme_names():
             indicator='Switch.'+widget+'.indicator'
@@ -294,7 +315,6 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
     style.configure('Switch.TCheckbutton',padding=(0,px(2)),background=c['bg'],focusthickness=0)
     style.configure('Treeview',background=c['bg'],fieldbackground=c['bg'],borderwidth=0,
                     rowheight=tkfont.nametofont('TkDefaultFont').metrics('linespace')+px(14))
-    _tp('E Entry/Spinbox/Switch')
     style.map('Treeview',background=[('selected',c['selected'])],foreground=[('selected',c['fg'])])
     style.configure('Treeview.Heading',background=c['sidebar'],font=normal,relief='flat',padding=(px(10),px(10)))
     style.map('Treeview.Heading',background=[('active',c['hover'])])
@@ -312,7 +332,7 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
                 radius=min(w,h)/2
                 cx=min(max(x,radius),w-radius);cy=min(max(y,radius),h-radius)
                 return fg if math.hypot(x-cx,y-cy)<=radius else bg
-            image=_raster(root,width,height,sample)
+            image=_raster(root,width,height,sample,transparent=rgb_bg)
             thumb_images.append(image)
         root._tkwebui_images.extend(thumb_images)
         track='Switch.'+orient+'.Scrollbar.trough'
@@ -330,7 +350,6 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
                         troughcolor=c['hover'],borderwidth=0,thickness=px(7))
         style.configure(orient+'.TScale',background=c['blue'],troughcolor=c['hover'],borderwidth=0)
     style.configure('TSeparator',background=c['border'])
-    _tp('F Treeview/Notebook/Scrollbar')
     for orientation,width,height in [('Horizontal',256,1),('Vertical',1,256)]:
         image=tk.PhotoImage(master=root,width=width,height=height)
         image.put(c['border'],to=(0,0,width,height));root._tkwebui_images.append(image)
@@ -339,17 +358,12 @@ def apply_theme(root, *, font_family='Microsoft YaHei UI', font_size=10, accent=
         style.layout(orientation+'.TSeparator',[(element_name,{'sticky':'nsew'})])
     style.configure('TPanedwindow',background=c['border'])
     from .widgets import configure_widget_styles, install_input_focus
-    _tp('G 分隔符')
     configure_widget_styles(root,style)
-    _tp('H widgets.configure_widget_styles')
     from .extras import configure_extra_styles
     configure_extra_styles(root,style)
-    _tp('I extras.configure_extra_styles')
     from .forms import configure_form_styles
     configure_form_styles(root,style)
-    _tp('J forms.configure_form_styles')
     install_input_focus(root)
-    _tp('K install_input_focus')
     root._tkwebui_ready=True
     return c.copy()
 
@@ -489,10 +503,36 @@ class ScrollArea(ttk.Frame):
         self.bind_class(self._wheel_tag,'<Destroy>',self.schedule)
         self.bind_class(self._wheel_tag,'<Unmap>',self.schedule)
     def resize(self,event):
-        if self._width!=event.width:
-            self._width=event.width
-            self.canvas.itemconfigure(self.window,width=event.width)
+        # The current width, not the event's: queued <Configure> events carry
+        # intermediate sizes (e.g. before the scrollbar appeared).
+        width=self.canvas.winfo_width()
+        if self._width!=width:
+            self._width=width
+            self.canvas.itemconfigure(self.window,width=width)
         self.schedule()
+    def prepare(self,width,height):
+        """Settle the layout at its final size before the area is first shown.
+
+        The body width, the scrollbar and any <Configure>-driven wrapping
+        depend on window events, which Tk delivers only once the area is on
+        screen: content would appear at its natural width, then widen. Placed
+        just outside its master, the area is laid out here and resized widgets
+        get their <Configure> now; no user input is processed. Afterwards
+        pack/grid/place it as usual.
+        """
+        self.place(x=width+8,y=0,width=width,height=height)
+        def walk(widget):
+            yield widget
+            for child in widget.winfo_children():
+                if not isinstance(child,tk.Toplevel):yield from walk(child)
+        sizes={}
+        for _ in range(8):
+            self.update_idletasks()
+            changed=[w for w in walk(self) if sizes.get(w)!=(w.winfo_width(),w.winfo_height())]
+            if not changed:break
+            for w in changed:
+                sizes[w]=(w.winfo_width(),w.winfo_height())
+                w.event_generate('<Configure>',x=w.winfo_x(),y=w.winfo_y(),width=sizes[w][0],height=sizes[w][1])
     def schedule(self,*_):
         if self._job is None:self._job=self.after_idle(self.refresh)
     def refresh(self):
@@ -1067,8 +1107,8 @@ class Modal(tk.Toplevel):
         if getattr(self.host,'_active_modal',None) is self:self.host._active_modal=None
         for job in (self._show_job,self._position_job,self._round_job,self._ready_job):
             if job is not None:self.after_cancel(job)
-        self.host.unbind('<Configure>',self._host_binding)
-        self.host.unbind('<Escape>',self._escape_binding)
+        unbind(self.host,'<Configure>',self._host_binding)
+        unbind(self.host,'<Escape>',self._escape_binding)
         self.grab_release();self.mask.destroy()
         super().destroy()
         if self.previous_grab is not None and self.previous_grab.winfo_exists():self.previous_grab.grab_set()

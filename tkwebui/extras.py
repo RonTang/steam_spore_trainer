@@ -4,7 +4,8 @@ import math
 import sys
 import tkinter as tk
 from tkinter import ttk, font as tkfont
-from .core import PALETTE, Card, ScrollArea, Modal, icon, _patch, _raster, _rgb, _tp
+from .core import PALETTE, Card, ScrollArea, Modal, icon, _patch, _raster, _rgb
+from .tcl_bridge import unbind
 
 
 def configure_extra_styles(root, style):
@@ -19,15 +20,58 @@ def configure_extra_styles(root, style):
             root._tkwebui_images.append(image)
             cache[key] = image
         return cache[key]
-    def surface(name, normal, states=(), radius=4):
+    def surface(name, normal, states=(), radius=4, **options):
         style.element_create(name, 'image', normal, *states, border=px(radius)+1,
-                             width=px(radius)*2+2, height=px(radius)*2+2, sticky='nsew')
-    # [启动优化] Toggle.TButton/Toolbutton 样式（~24ms）：本程序未使用，整块删除。
-    # [启动优化] SquareSwitch 8 张位图（~0.17s）：本程序未使用该控件，整段移除。
+                             width=px(radius)*2+2, height=px(radius)*2+2, sticky='nsew', **options)
+    for name, plain in [('Toggle.TButton', False), ('Toolbutton', True)]:
+        element = 'Web.'+name+'.surface'
+        surface(element, face(c['bg'], c['bg'] if plain else c['border']), [
+            ('disabled selected', face(c['sidebar'], c['border'])),
+            ('disabled', face(c['bg'], c['bg'] if plain else c['border'])),
+            ('pressed', face(c['selected'], c['blue'])),
+            ('selected', face(c['selected'], c['blue'] if not plain else c['selected'])),
+            ('focus', face(c['bg'], c['blue'])),
+            ('active', face(c['hover'], c['hover'] if plain else c['border'])),
+        # Same box as TButton: the style padding alone sets the content inset
+        # (ttk would default an image element's padding to its border).
+        ], padding=0)
+        style.layout(name, [(element, {'sticky':'nsew', 'children':[
+            ('Checkbutton.padding', {'sticky':'nsew', 'children':[
+                ('Checkbutton.label', {'sticky':'nsew'})]})]})])
+        style.configure(name, padding=(px(12),px(7)), anchor='center', foreground=c['fg'])
+        style.map(name, foreground=[('disabled',c['disabled']),('selected',c['blue'])])
+    # Compact rectangular switch; square thumb, with state handling kept in ttk.
+    switch_images={}
+    for on in (False,True):
+        for state in ('normal','active','focus','disabled'):
+            width,height=px(40),px(26)
+            track_color=(c['disabled'] if on else '#D9DEE6') if state=='disabled' else (
+                c['accent_hover'] if on and state=='active' else c['accent'] if on else
+                '#858E9C' if state=='active' else '#9B9DA7')
+            def sample(x,y,on=on,state=state,width=width,height=height,track_color=track_color):
+                x=x*40/width;y=y*26/height
+                if state=='focus' and 0.5<=x<=39.5 and 0.5<=y<=25.5:
+                    if x<1.5 or x>38.5 or y<1.5 or y>24.5:return _rgb(c['blue'])
+                if not (3<=x<=37 and 3<=y<=23):return _rgb(c['bg'])
+                left=20 if on else 6
+                if left<=x<=left+14 and 6<=y<=20:
+                    return _rgb('#F7F8FA' if state=='disabled' else '#FFFFFF')
+                return _rgb(track_color)
+            image=_raster(root,width,height,sample)
+            switch_images[on,state]=image;root._tkwebui_images.append(image)
+    style.element_create('Web.SquareSwitch.indicator','image',switch_images[False,'normal'],
+        ('disabled selected',switch_images[True,'disabled']),('disabled',switch_images[False,'disabled']),
+        ('focus selected',switch_images[True,'focus']),('focus',switch_images[False,'focus']),
+        ('active selected',switch_images[True,'active']),('active',switch_images[False,'active']),
+        ('selected',switch_images[True,'normal']),width=px(40),height=px(26),sticky='')
+    style.layout('Square.Switch.TCheckbutton',[('Checkbutton.padding',{'sticky':'nsew','children':[
+        ('Web.SquareSwitch.indicator',{'side':'left'}),('Checkbutton.label',{'side':'left','sticky':'w'})]})])
+    style.configure('Square.Switch.TCheckbutton',background=c['bg'],padding=(0,px(2)),foreground=c['fg'])
+    style.map('Square.Switch.TCheckbutton',background=[('active',c['bg'])],foreground=[('disabled',c['disabled'])])
     for name in ('TMenubutton', 'TOptionMenu'):
         style.layout(name, [('TButton.surface', {'sticky':'nsew','children':[
             ('Menubutton.padding', {'sticky':'nsew','children':[
-                ('Switch.Dropdown.arrow', {'side':'right'}),
+                ('Switch.Dropdown.arrow', {'side':'right','sticky':''}),
                 ('Menubutton.label', {'side':'left','sticky':'nsew','expand':True})]})]})])
         style.configure(name, padding=(px(10),px(7)), anchor='w')
         style.map(name, foreground=[('disabled',c['disabled'])])
@@ -48,9 +92,66 @@ def configure_extra_styles(root, style):
     style.configure('TNotebook', background=c['bg'], padding=px(1), tabmargins=(0,0,0,px(7)))
     style.configure('TNotebook.Tab', padding=(px(16),px(8)), foreground=c['muted'])
     style.map('TNotebook.Tab', foreground=[('disabled',c['disabled']),('selected',c['blue'])])
-    # [启动优化] Sash grip 位图（~0.08s）：本程序未使用 Panedwindow，整段移除。
-    # [启动优化] Scale 轨道/滑块/Progress 位图（~0.5s）：本程序未使用这些控件，整段移除。
-    # 若将来需要，从备份的 extras.py 恢复这三段即可。
+    # Both sash orientations have a generous hit target and a small visible handle.
+    for orientation in ('Horizontal','Vertical'):
+        horizontal = orientation == 'Horizontal'
+        w,h = (px(36),px(12)) if horizontal else (px(12),px(36))
+        def sample(x,y,w=w,h=h,horizontal=horizontal):
+            long,short = (x,y) if horizontal else (y,x)
+            length,thickness = (w,h) if horizontal else (h,w)
+            center=min(max(long,px(5)),length-px(5))
+            return _rgb('#BFC4CD') if math.hypot(long-center,short-thickness/2)<=max(1,scale) else _rgb(c['bg'])
+        grip=_raster(root,w,h,sample); root._tkwebui_images.append(grip)
+        name='Web.'+orientation+'.Sash.grip'
+        style.element_create(name,'image',grip,width=w,height=h,sticky='')
+        style.layout(orientation+'.Sash',[(name,{'sticky':'ns' if not horizontal else 'ew'})])
+    style.configure('Sash',sashthickness=px(12),gripcount=0)
+    # Round and compact-bar slider variants share native ttk Scale behavior.
+    for orient in ('Horizontal','Vertical'):
+        horizontal=orient=='Horizontal'
+        w,h=(px(128),px(24)) if horizontal else (px(24),px(128))
+        def track(x,y,w=w,h=h,horizontal=horizontal):
+            long,short=(x,y) if horizontal else (y,x)
+            length,thickness=(w,h) if horizontal else (h,w)
+            center=min(max(long,px(12)),length-px(12))
+            return _rgb(c['hover']) if math.hypot(long-center,short-thickness/2)<=px(2) else _rgb(c['bg'])
+        image=_raster(root,w,h,track); root._tkwebui_images.append(image)
+        track_name='Web.'+orient+'.Scale.trough'
+        style.element_create(track_name,'image',image,border=(px(12),0) if horizontal else (0,px(12)),
+                             width=px(24),height=px(24),sticky='nsew')
+        for variant in ('','Tick.'):
+            images=[]
+            size=px(24)
+            for edge,fill in [(c['border'],c['bg']),(c['blue'],c['bg']),(c['disabled'],c['sidebar'])]:
+                def thumb(x,y,edge=edge,fill=fill,variant=variant,size=size,horizontal=horizontal):
+                    cx,cy=size/2,size/2
+                    if variant:
+                        a,b=(x,y) if horizontal else (y,x)
+                        nearest=min(max(b,cy-px(5)),cy+px(5))
+                        distance=math.hypot(a-cx,b-nearest)
+                        return _rgb(edge if edge==c['disabled'] else c['blue']) if distance<=px(2) else _rgb(c['bg'])
+                    d=math.hypot(x-cx,y-cy)
+                    return _rgb(fill) if d<px(7)-1 else _rgb(edge) if d<=px(7) else _rgb(c['bg'])
+                im=_raster(root,size,size,thumb,transparent=_rgb(c['bg']) if variant else None,
+                           outside=None if variant else lambda xx,yy,size=size:math.hypot(xx+.5-size/2,yy+.5-size/2)>px(7)+1)
+                root._tkwebui_images.append(im);images.append(im)
+            slider_name='Web.'+orient+'.'+variant+'Scale.slider'
+            style.element_create(slider_name,'image',images[0],('disabled',images[2]),('pressed',images[1]),('active',images[1]),('focus',images[1]),width=size,height=size,sticky='')
+            name=orient+'.'+variant+'TScale'
+            style.layout(name,[(track_name,{'sticky':'ew' if horizontal else 'ns','children':[
+                (slider_name,{'side':'left' if horizontal else 'top','sticky':''})]})])
+            style.configure(name,background=c['bg'],borderwidth=0)
+        # Small-radius progress surfaces, horizontal and vertical.
+        for part,color in [('trough',c['hover']),('pbar',c['accent'])]:
+            width,height=(px(128),px(7)) if horizontal else (px(7),px(128))
+            im=_patch(root,color,color,c['bg'],px(2),width=width,height=height)
+            root._tkwebui_images.append(im)
+            element='Web.'+orient+'.Progress.'+part
+            style.element_create(element,'image',im,border=px(2),width=px(7),height=px(7),sticky='nsew')
+        style.layout(orient+'.TProgressbar', [('Progressbar.padding',{'sticky':'nsew','children':[
+            ('Web.'+orient+'.Progress.trough',{'sticky':'ew' if horizontal else 'ns','children':[
+                ('Web.'+orient+'.Progress.pbar',{'side':'left' if horizontal else 'bottom','sticky':'ns' if horizontal else 'ew'})]})]})])
+        style.configure(orient+'.TProgressbar',background=c['bg'],thickness=px(7),borderwidth=0,padding=(px(14),0) if horizontal else (0,px(14)))
     blank=tk.PhotoImage(master=root,width=px(16),height=px(16));root._tkwebui_images.append(blank)
     style.element_create('Web.Tree.indicator','image',icon(root,'chevronright',px(13)),('user2',blank),('user1',icon(root,'chevrondown',px(13))),width=px(24),sticky='')
     style.layout('Treeview.Item',[('Treeitem.padding',{'sticky':'nsew','children':[
@@ -216,6 +317,27 @@ class RoundedListbox(tk.Listbox):
     def place_info(self):return self.container.place_info()
 
 
+def _monitor_api():
+    """Private user32 prototypes. Setting argtypes on the shared ctypes.windll
+    object would break other code (including the host program) that calls the
+    same functions with its own structures."""
+    global _MONITOR_API
+    if _MONITOR_API is None:
+        import ctypes
+        from types import SimpleNamespace
+        from ctypes import wintypes as w
+        class MonitorInfo(ctypes.Structure):
+            _fields_=[('cbSize',w.DWORD),('rcMonitor',w.RECT),('rcWork',w.RECT),('dwFlags',w.DWORD)]
+        user=ctypes.WinDLL('user32')
+        user.MonitorFromPoint.argtypes=[w.POINT,w.DWORD];user.MonitorFromPoint.restype=w.HANDLE
+        user.GetMonitorInfoW.argtypes=[w.HANDLE,ctypes.POINTER(MonitorInfo)];user.GetMonitorInfoW.restype=w.BOOL
+        _MONITOR_API=SimpleNamespace(ctypes=ctypes,w=w,user=user,MonitorInfo=MonitorInfo)
+    return _MONITOR_API
+
+
+_MONITOR_API=None
+
+
 class MenuPopup(tk.Toplevel):
     """Shared menu renderer with native Menu commands/variables and nested popups."""
     def __init__(self,owner,menu,x,y,*,min_width=190,parent_popup=None,parent_index=None,selected=None):
@@ -300,15 +422,9 @@ class MenuPopup(tk.Toplevel):
     @staticmethod
     def work_area(x,y):
         if sys.platform=='win32':
-            import ctypes
-            from ctypes import wintypes as w
-            class MonitorInfo(ctypes.Structure):
-                _fields_=[('cbSize',w.DWORD),('rcMonitor',w.RECT),('rcWork',w.RECT),('dwFlags',w.DWORD)]
-            user=ctypes.windll.user32
-            user.MonitorFromPoint.argtypes=[w.POINT,w.DWORD];user.MonitorFromPoint.restype=w.HANDLE
-            user.GetMonitorInfoW.argtypes=[w.HANDLE,ctypes.POINTER(MonitorInfo)]
-            info=MonitorInfo();info.cbSize=ctypes.sizeof(info)
-            if user.GetMonitorInfoW(user.MonitorFromPoint(w.POINT(int(x),int(y)),2),ctypes.byref(info)):
+            api=_monitor_api()
+            info=api.MonitorInfo();info.cbSize=api.ctypes.sizeof(info)
+            if api.user.GetMonitorInfoW(api.user.MonitorFromPoint(api.w.POINT(int(x),int(y)),2),api.ctypes.byref(info)):
                 r=info.rcWork;return r.left,r.top,r.right,r.bottom
         root=tk._default_root
         return 0,0,root.winfo_screenwidth(),root.winfo_screenheight()
@@ -394,8 +510,8 @@ class MenuPopup(tk.Toplevel):
             self.parent_popup.child_popup=None
             super().destroy()
             return 'break'
-        if self._host_binding:self.host.unbind('<Configure>',self._host_binding)
-        if self._destroy_binding:self.host.unbind('<Destroy>',self._destroy_binding)
+        if self._host_binding:unbind(self.host,'<Configure>',self._host_binding)
+        if self._destroy_binding:unbind(self.host,'<Destroy>',self._destroy_binding)
         if getattr(self.host,'_choice_popup',None) is self:self.host._choice_popup=None
         self.grab_release();super().destroy()
         try:
@@ -407,50 +523,3 @@ class MenuPopup(tk.Toplevel):
         except tk.TclError:pass
         return 'break'
     def destroy(self):self.close()
-
-class PlaceholderEntry(ttk.Entry):
-    """ttk.Entry with a muted placeholder. get() returns '' while the placeholder is shown."""
-    def __init__(self, master=None, placeholder='', **kwargs):
-        self._placeholder = placeholder or ''
-        self._showing = False
-        self._normal_style = kwargs.get('style') or 'TEntry'
-        super().__init__(master, **kwargs)
-        if self._placeholder:
-            self._show()
-            self.bind('<FocusIn>', self._on_focus_in)
-            self.bind('<FocusOut>', self._on_focus_out)
-
-    def _show(self):
-        if self._showing:          # 幂等：重复调用/异常事件序列都不会叠加文本
-            return
-        ttk.Style(self).configure('Placeholder.TEntry', foreground=PALETTE['muted'])
-        ttk.Entry.insert(self, 0, self._placeholder)
-        ttk.Entry.configure(self, style='Placeholder.TEntry')
-        self._showing = True
-
-    def _hide(self):
-        if not self._showing:
-            return
-        ttk.Entry.delete(self, 0, 'end')
-        ttk.Entry.configure(self, style=self._normal_style)
-        self._showing = False
-
-    def _on_focus_in(self, event=None):
-        self._hide()
-
-    def _on_focus_out(self, event=None):
-        # 直接读底层文本，语义直白：没在显示占位符、且内容为空 → 显示
-        if not self._showing and not ttk.Entry.get(self).strip():
-            self._show()
-
-    def get(self):
-        return '' if self._showing else ttk.Entry.get(self)
-
-    def insert(self, index, string):
-        self._hide()               # 幂等：没在显示占位符时 _hide 是空操作
-        return ttk.Entry.insert(self, index, string)
-
-    def delete(self, first, last=None):
-        self._hide()
-        return ttk.Entry.delete(self, first, last)   # 继续执行，语义落地
-
