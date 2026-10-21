@@ -4,18 +4,15 @@ Keeps a real taskbar window, system menu, resize borders and Windows maximize.
 No overrideredirect(), fake minimize window, WebView, or third-party package.
 On non-Windows systems the ordinary OS title bar is retained.
 
-Patched:
-1. attach() 时把包装窗口尺寸校正回 wm geometry 指定的客户区尺寸
-   （边框已被 WM_NCCALCSIZE 吞掉，否则窗口会以 客户区+边框 的尺寸打开）。
-2. WM_GETMINMAXINFO 检测到 Tk 的固定尺寸签名(min==max)时，把 min/max
-   track 锁定为当前实际窗口尺寸，修复 resizable(False) 窗口被 Windows
-   每次拖动强制撑宽的问题。
-3. on_ready 回调 + <<ChromeReady>> 虚拟事件：attach 全部完成（标题栏已
-   移除、尺寸已校正）后再延时约 120ms 触发（等 refresh/NCCALCSIZE/DWM
-   首帧合成全部落地），用户此刻 reposition/deiconify 窗口看到的即是成品——
-   内建的 ready-to-show 钩子。
+Patched (ready-to-show hook):
+on_ready 回调 + <<ChromeReady>> 虚拟事件：attach 完成（标题栏移除、尺寸校正、
+NCCALCSIZE 重排落地）后才触发，用户此刻 reposition/deiconify/淡入窗口
+看到的即是成品。事件驱动：window_proc 检测"客户区尺寸落到 _fixed_size 的那组
+WM_SIZE"（重排全部落地的精确信号，只置标志不重入 Tcl），由随后的
+refresh_cache（idle，安全）触发回调；300ms 兜底仅防御极端情况。
 """
 from __future__ import annotations
+import re
 import sys
 import tkinter as tk
 from tkinter import ttk
@@ -45,11 +42,15 @@ class WindowChrome:
         self._native_moving=False
         self._system_move_pending=False
         self.system_move_count=0
-        self._fixed_size=None
         self.resize_handles={}
         self.toolbar=toolbar
         self.sidebar=sidebar
         self.drag_widgets=list(drag_widgets)
+        # resizable() per axis, and the client size a fixed axis must keep.
+        self._resize_axes=(True,True)
+        self._fixed_size=None
+        self._size_job=None
+        self._geometry_originals={}
         if sys.platform!='win32':
             if on_ready is not None:root.after_idle(on_ready)
             return
@@ -70,6 +71,12 @@ class WindowChrome:
         self.u.RedrawWindow.argtypes=[w.HWND,ctypes.c_void_p,w.HANDLE,w.UINT]
         self.u.GetWindowRect.argtypes=[w.HWND,ctypes.POINTER(w.RECT)]
         self.u.IsZoomed.argtypes=[w.HWND]
+        self.u.IsIconic.argtypes=[w.HWND];self.u.IsIconic.restype=w.BOOL
+        self.u.IsWindow.argtypes=[w.HWND];self.u.IsWindow.restype=w.BOOL
+        self.u.GetMenu.argtypes=[w.HWND];self.u.GetMenu.restype=w.HMENU
+        self.u.AdjustWindowRectEx.argtypes=[ctypes.POINTER(w.RECT),w.DWORD,w.BOOL,w.DWORD]
+        try:self.u.AdjustWindowRectExForDpi.argtypes=[ctypes.POINTER(w.RECT),w.DWORD,w.BOOL,w.DWORD,w.UINT]
+        except AttributeError:pass  # Windows before 10 1607
         self.u.SendMessageW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM];self.u.SendMessageW.restype=ctypes.c_ssize_t
         self.u.PostMessageW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM];self.u.PostMessageW.restype=w.BOOL
         self.u.DefWindowProcW.argtypes=[w.HWND,w.UINT,w.WPARAM,w.LPARAM];self.u.DefWindowProcW.restype=ctypes.c_ssize_t
@@ -122,13 +129,21 @@ class WindowChrome:
         self.hwnd=wrapper
         self.original_style=self.get_long(self.hwnd,-16)
         self.original_exstyle=self.get_long(self.hwnd,-20)
+        self._resize_axes=tuple(bool(value) for value in self.root.resizable())
+        # Tk sized the wrapper as client + OS frame. Once WM_NCCALCSIZE hands
+        # the whole wrapper to the client, that frame becomes extra content
+        # (640x420 opened as 662x476). Remember what the program asked for.
+        # Also runs when Tk replaced its wrapper; that one is client + frame again.
+        self._fixed_size=self._requested_size()
+        self._install_geometry_bridge()
         self._callback=self.PROC(self.window_proc)  # Must stay alive for the window lifetime.
         self._old_proc=self.set_long(self.hwnd,-4,self.c.cast(self._callback,self.c.c_void_p))
         if not self._old_proc:return
         self.attached=True
         # Keep standard window capabilities for native Snap/animations. The
         # caption is hidden by WM_NCCALCSIZE, not by stripping capability flags.
-        style=self.original_style|0x00C00000|0x00040000|0x00080000|0x00020000|0x00010000
+        # Resize border / maximize box only where Tk's resizable() allows it.
+        style=self._capability_style(self.original_style|0x00C00000|0x00080000|0x00020000)
         self.set_long(self.hwnd,-16,self.c.c_void_p(style))
         self.set_long(self.hwnd,-20,self.c.c_void_p((self.original_exstyle|0x00040000)&~0x00000080))
         margins=(self.c.c_int*4)(1,1,1,1)
@@ -136,26 +151,21 @@ class WindowChrome:
         corner=self.c.c_int(2)
         self.dwm.DwmSetWindowAttribute(self.hwnd,33,self.c.byref(corner),self.c.sizeof(corner))
         self.u.SetWindowPos(self.hwnd,None,0,0,0,0,0x0001|0x0002|0x0004|0x0010|0x0020)
-        # PATCH(1): wm geometry 的宽高是客户区尺寸，Tk 按带边框样式计算包装
-        # 窗口尺寸；WM_NCCALCSIZE 返回 0 后客户区==整个包装窗口，若不校正，
-        # 窗口会以 客户区+边框 的尺寸打开（视觉上"窗口很宽/很高"）。
-        try:
-            size=self.root.wm_geometry().split('+')[0].split('-')[0]  # "640x420"
-            w_req,h_req=(int(v) for v in size.split('x'))
-            # 固定尺寸锁定的基准：wm geometry 请求的客户区尺寸。
-            # 必须是常量——最小化还原的过渡过程中，WM_SIZE/窗口矩形
-            # 都可能是任务栏小条的尺寸，读运行时消息会锁错。
-            self._fixed_size=(w_req,h_req)
-            self.u.SetWindowPos(self.hwnd,None,0,0,w_req,h_req,0x0002|0x0004|0x0010)
-        except Exception:
-            pass
-        self.install_resize_handles()
+        if not self.u.IsZoomed(self.hwnd) and not self.u.IsIconic(self.hwnd):
+            width,height=self._fixed_size
+            self.u.SetWindowPos(self.hwnd,None,0,0,width,height,0x0002|0x0004|0x0010)
+        if not self.resize_handles:self.install_resize_handles()
+        self.sync_capabilities()
         self.schedule_cache()
-        # PATCH(3): ready-to-show 钩子，事件驱动而非定时猜测：
-        # 等"客户端尺寸落到 _fixed_size 的那组 WM_SIZE"——它是
-        # NCCALCSIZE 重排全部落地的精确信号（见 window_proc 置标志），
-        # 由随后的 refresh_cache（跑在 idle，Tcl 安全）接管触发。
-        # 300ms 兜底仅防御极端情况（正常路径 WM_SIZE 必到）。
+        # PATCH(4): ready-to-show 钩子，事件驱动而非定时猜测：
+        # 等"客户端尺寸落到 _fixed_size 的那组 WM_SIZE"——它是 NCCALCSIZE
+        # 重排全部落地的精确信号（见 window_proc 置标志），由随后的
+        # refresh_cache（跑在 idle，Tcl 安全）接管触发。300ms 兜底仅防御
+        # 极端情况（正常路径 WM_SIZE 必到；最大化/最小化态 attach 时由兜底接管）。
+        if self._ready_job is not None:
+            try:self.root.after_cancel(self._ready_job)
+            except tk.TclError:pass
+            self._ready_job=None
         self._ready_armed=True
         self._size_settled=False
         self._ready_job=self.root.after(300,self._fire_ready)
@@ -167,6 +177,81 @@ class WindowChrome:
             except Exception:pass
         try:self.root.event_generate('<<ChromeReady>>')
         except tk.TclError:pass
+
+    def _requested_size(self):
+        """Client size the program requested, read before the frame is removed.
+
+        Derived from the native outer rectangle minus the frame Tk added. On a
+        monitor whose DPI differs from Tk's startup DPI, winfo_width() already
+        contains the frame-size mismatch, so it is only a fallback.
+        """
+        outer=self.w.RECT()
+        self.u.GetWindowRect(self.hwnd,self.c.byref(outer))
+        frame=self.w.RECT(0,0,0,0)
+        menu=bool(self.u.GetMenu(self.hwnd))
+        dpi=round(self.root.winfo_fpixels('1i'))
+        try:ok=self.u.AdjustWindowRectExForDpi(self.c.byref(frame),self.original_style,menu,self.original_exstyle,dpi)
+        except AttributeError:ok=self.u.AdjustWindowRectEx(self.c.byref(frame),self.original_style,menu,self.original_exstyle)
+        if ok and outer.right>outer.left:
+            return (max(1,outer.right-outer.left-(frame.right-frame.left)),max(1,outer.bottom-outer.top-(frame.bottom-frame.top)))
+        return (max(1,self.root.winfo_width()),max(1,self.root.winfo_height()))
+
+    def _capability_style(self,style):
+        style=style|0x00040000 if any(self._resize_axes) else style&~0x00040000     # WS_THICKFRAME
+        return style|0x00010000 if all(self._resize_axes) else style&~0x00010000    # WS_MAXIMIZEBOX
+
+    def sync_capabilities(self):
+        """Follow root.resizable(), including changes made after attach()."""
+        if not self.attached:return
+        # [robustness] refresh_cache 可能在 controls 被销毁后仍被触发
+        # （应用自绘 chrome 按钮后 destroy 原生按钮是库的合法用法）：
+        # 原生按钮已不存在时，跳过与它们相关的状态同步。
+        if not self.max_button.winfo_exists():return
+        previous=self._resize_axes
+        self._resize_axes=tuple(bool(value) for value in self.root.resizable())
+        if previous!=self._resize_axes and not self.u.IsIconic(self.hwnd):
+            # An axis that just became fixed keeps its current size.
+            size=list(self._fixed_size or (self.root.winfo_width(),self.root.winfo_height()))
+            for axis in (0,1):
+                if previous[axis] and not self._resize_axes[axis]:
+                    size[axis]=self.root.winfo_width() if axis==0 else self.root.winfo_height()
+            self._fixed_size=tuple(size)
+        style=self.get_long(self.hwnd,-16);updated=self._capability_style(style)
+        if updated!=style:
+            self.set_long(self.hwnd,-16,self.c.c_void_p(updated))
+            self.u.SetWindowPos(self.hwnd,None,0,0,0,0,0x0001|0x0002|0x0004|0x0010|0x0020)
+        allowed=all(self._resize_axes) or bool(self.u.IsZoomed(self.hwnd))
+        self.max_button.state(['!disabled'] if allowed else ['disabled'])
+        self.paint_control('maximize')
+        if previous!=self._resize_axes:self.layout_resize_handles()
+
+    def _install_geometry_bridge(self):
+        """Keep the stable size in step with root.geometry('WxH') at runtime."""
+        if self._geometry_originals:return
+        original=self.root.wm_geometry
+        for name in ('geometry','wm_geometry'):
+            self._geometry_originals[name]=(name in self.root.__dict__,getattr(self.root,name))
+        def geometry(value=None):
+            match=re.match(r'^\s*(\d+)x(\d+)',str(value)) if value is not None else None
+            if match and self.attached:
+                lower=self.root.minsize();upper=self.root.maxsize()
+                self._fixed_size=tuple(max(lower[i],min(upper[i],int(match.group(i+1)))) for i in (0,1))
+            result=original(value)
+            if match and self.attached:
+                # Tk re-adds its frame size; restore the exact requested size.
+                if self._size_job is not None:self.root.after_cancel(self._size_job)
+                self._size_job=self.root.after_idle(lambda:self._apply_fixed_size(all_axes=True))
+            return result
+        self._geometry_bridge=geometry
+        self.root.geometry=self.root.wm_geometry=geometry
+
+    def _apply_fixed_size(self,all_axes=False):
+        self._size_job=None
+        if not self.attached or self._fixed_size is None or self.u.IsIconic(self.hwnd) or self.u.IsZoomed(self.hwnd):return
+        rect=self.w.RECT();self.u.GetWindowRect(self.hwnd,self.c.byref(rect))
+        width=rect.right-rect.left if self._resize_axes[0] and not all_axes else self._fixed_size[0]
+        height=rect.bottom-rect.top if self._resize_axes[1] and not all_axes else self._fixed_size[1]
+        self.u.SetWindowPos(self.hwnd,None,0,0,width,height,0x0002|0x0004|0x0010)
 
     def install_resize_handles(self):
         # Tk child HWNDs cover the client edges after WM_NCCALCSIZE removes
@@ -192,6 +277,7 @@ class WindowChrome:
             for handle in self.resize_handles.values():handle.place_forget()
             return
         edge=getattr(self,'resize_margin',7);corner=edge*2
+        horizontal_ok,vertical_ok=self._resize_axes
         positions={
             'left':dict(x=0,y=corner,width=edge,relheight=1,height=-2*corner),
             'right':dict(relx=1,x=-edge,y=corner,width=edge,relheight=1,height=-2*corner),
@@ -202,6 +288,9 @@ class WindowChrome:
             'bottomleft':dict(x=0,rely=1,y=-corner,width=corner,height=corner),
             'bottomright':dict(relx=1,x=-corner,rely=1,y=-corner,width=corner,height=corner)}
         for name,handle in self.resize_handles.items():
+            # No resize targets on an axis the program fixed with resizable().
+            if ('left' in name or 'right' in name) and not horizontal_ok or ('top' in name or 'bottom' in name) and not vertical_ok:
+                handle.place_forget();continue
             handle.place(**positions[name]);handle.lift()
             if hasattr(handle,'sidebar_fill'):
                 sidebar=self.sidebar
@@ -211,6 +300,8 @@ class WindowChrome:
 
     def start_resize(self,direction,event=None):
         if not self.attached or self.u.IsZoomed(self.hwnd):return 'break'
+        if direction in (1,2,4,5,7,8) and not self._resize_axes[0]:return 'break'
+        if direction in (3,4,5,6,7,8) and not self._resize_axes[1]:return 'break'
         if self.root.grab_current() is not None:return 'break'
         self.u.ReleaseCapture()
         self._system_move_pending=True
@@ -254,33 +345,22 @@ class WindowChrome:
                         rect=self.c.cast(lparam,self.c.POINTER(self.w.RECT)).contents
                         rect.left,rect.top,rect.right,rect.bottom=info.rcWork.left,info.rcWork.top,info.rcWork.right,info.rcWork.bottom
                 return 0
+            if message==0x0112 and wparam&0xfff0==0xF030 and not all(self._resize_axes):
+                return 0  # SC_MAXIMIZE: a resizable(False) window never maximizes
             if message==0x0024:  # WM_GETMINMAXINFO, including multi-monitor taskbar bounds.
                 result=self.u.CallWindowProcW(self._old_proc,hwnd,message,wparam,lparam)
-                # PATCH(2): Tk 给固定尺寸窗口的 min/max track 加了 2×边框宽，
-                # 但边框已被 WM_NCCALCSIZE 吞进客户区，Windows 每次拖动都按
-                # track 强制校正，窗口越拖越宽。检测到 Tk 的固定尺寸签名
-                # (min==max) 时直接锁定为当前实际窗口尺寸——不猜差值，且对
-                # 任何 Tk 版本/任何 DPI 都成立。
                 limits=self.c.cast(lparam,self.c.POINTER(self.MinMaxInfo)).contents
-                fixed=limits.ptMinTrackSize.x==limits.ptMaxTrackSize.x and limits.ptMinTrackSize.y==limits.ptMaxTrackSize.y
-                if fixed:
-                    # 用 attach 时存下的请求尺寸常量，不用任何运行时读数：
-                    # 最小化还原的过渡瞬间，窗口矩形/WM_SIZE 都还是任务栏
-                    # 小条的尺寸，读瞬时值会把 track 锁成最小化尺寸
-                    if self._fixed_size is not None:
-                        cur_w,cur_h=self._fixed_size
-                    else:
-                        rect=self.w.RECT();self.u.GetWindowRect(hwnd,self.c.byref(rect))
-                        cur_w=rect.right-rect.left;cur_h=rect.bottom-rect.top
-                        limits.ptMaxPosition.x=rect.left;limits.ptMaxPosition.y=rect.top
-                    limits.ptMinTrackSize.x=limits.ptMaxTrackSize.x=cur_w
-                    limits.ptMinTrackSize.y=limits.ptMaxTrackSize.y=cur_h
-                    # 固定尺寸窗口同时禁用最大化：否则最大化按钮/双击标题栏/
-                    # Win+↑ 仍能绕开 resizable(False) 改变窗口尺寸
-                    limits.ptMaxSize.x=cur_w;limits.ptMaxSize.y=cur_h
+                # Tk locks a fixed axis to client + 2 x frame, but the frame is
+                # now part of the client. Windows enforced that on every move
+                # (+22 px per drag) and from transient minimize/restore sizes.
+                # Lock fixed axes to the stable requested size instead.
+                if self._fixed_size is not None:
+                    if not self._resize_axes[0]:
+                        limits.ptMinTrackSize.x=limits.ptMaxTrackSize.x=limits.ptMaxSize.x=self._fixed_size[0]
+                    if not self._resize_axes[1]:
+                        limits.ptMinTrackSize.y=limits.ptMaxTrackSize.y=limits.ptMaxSize.y=self._fixed_size[1]
                 info=self.work_area()
-                if info and not fixed:
-                    limits=self.c.cast(lparam,self.c.POINTER(self.MinMaxInfo)).contents
+                if info and all(self._resize_axes):
                     limits.ptMaxPosition.x=info.rcWork.left-info.rcMonitor.left
                     limits.ptMaxPosition.y=info.rcWork.top-info.rcMonitor.top
                     limits.ptMaxSize.x=info.rcWork.right-info.rcWork.left
@@ -290,8 +370,8 @@ class WindowChrome:
                 x=self.c.c_short(lparam&0xffff).value;y=self.c.c_short((lparam>>16)&0xffff).value
                 rect=self.w.RECT();self.u.GetWindowRect(hwnd,self.c.byref(rect))
                 edge=getattr(self,'resize_margin',7)
-                left=x<rect.left+edge;right=x>=rect.right-edge
-                top=y<rect.top+edge;bottom=y>=rect.bottom-edge
+                left=x<rect.left+edge and self._resize_axes[0];right=x>=rect.right-edge and self._resize_axes[0]
+                top=y<rect.top+edge and self._resize_axes[1];bottom=y>=rect.bottom-edge and self._resize_axes[1]
                 if not self.u.IsZoomed(hwnd):
                     if top and left:return 13
                     if top and right:return 14
@@ -316,6 +396,15 @@ class WindowChrome:
     def refresh_cache(self):
         self._cache_job=None
         if not self.attached:return
+        # Tk destroys and recreates its wrapper HWND after wm resizable /
+        # transient / attributes changes. Follow it, or the new wrapper shows
+        # the native caption again and every Win32 call targets a dead handle.
+        wrapper=self.u.GetParent(self.root.winfo_id())
+        if wrapper and wrapper!=self.hwnd:
+            if self.u.IsWindow(self.hwnd):self.set_long(self.hwnd,-4,self.c.c_void_p(self._old_proc))
+            self.attached=False
+            self.attach()
+            return
         if self._ready_armed and self._size_settled:
             # 尺寸消息已落地，且事件队列已抽空（refresh 本身跑在 idle）：
             # 这就是"真 ready"时刻——取消兜底定时，一帧后回调
@@ -325,6 +414,7 @@ class WindowChrome:
                 except tk.TclError:pass
                 self._ready_job=None
             self._ready_job=self.root.after_idle(self._fire_ready)
+        self.sync_capabilities()
         self.resize_margin=max(5,round(self.root.winfo_fpixels('1i')/96*5))
         self.layout_resize_handles()
         def rect(widget):
@@ -337,9 +427,13 @@ class WindowChrome:
         self.paint_control('maximize',False)
 
     def paint_control(self,key,hover=False):
+        button=self.buttons.get(key)
+        if button is None or not button.winfo_exists():return
         pinned=key=='pin' and self.pinned
+        disabled=self.buttons[key].instate(['disabled'])
+        hover=hover and not disabled
         background=('#FFE8E8' if key=='close' else PALETTE['hover']) if hover else PALETTE['selected'] if pinned else PALETTE['bg']
-        color='#DD3333' if key=='close' and hover else PALETTE['blue'] if pinned else PALETTE['muted']
+        color=PALETTE['disabled'] if disabled else '#DD3333' if key=='close' and hover else PALETTE['blue'] if pinned else PALETTE['muted']
         symbol='restore' if key=='maximize' and self.attached and self.u.IsZoomed(self.hwnd) else key
         signature=(symbol,color,background,pinned)
         if self._drawn_controls.get(key)==signature:return
@@ -401,6 +495,8 @@ class WindowChrome:
         self.toggle_maximize();return 'break'
 
     def toggle_maximize(self):
+        # Double-click and the maximize button do nothing for a fixed window.
+        if not all(self.root.resizable()) and self.root.state()!='zoomed':return
         self.begin_update()
         try:
             self.root.state('normal' if self.root.state()=='zoomed' else 'zoomed')
@@ -427,18 +523,21 @@ class WindowChrome:
         self.close_action()
 
     def detach(self):
-        if sys.platform!='win32':
-            if on_ready is not None:root.after_idle(on_ready)
-            return
+        if sys.platform!='win32':return
         self.cancel_drag()
         for handle in self.resize_handles.values():
             if handle.winfo_exists():handle.destroy()
         self.resize_handles.clear()
         while self._batch_depth:self.end_update()
-        for job in (self._cache_job,getattr(self,'_attach_job',None),self._ready_job):
+        for job in (self._cache_job,getattr(self,'_attach_job',None),self._size_job,self._ready_job):
             if job is not None:
                 try:self.root.after_cancel(job)
                 except tk.TclError:pass
         if self.attached and self._old_proc:
             self.set_long(self.hwnd,-4,self.c.c_void_p(self._old_proc))
             self.attached=False
+        for name,(owned,original) in self._geometry_originals.items():
+            if getattr(self.root,name,None) is self._geometry_bridge:
+                if owned:setattr(self.root,name,original)
+                else:self.root.__dict__.pop(name,None)
+        self._geometry_originals.clear()
