@@ -11,8 +11,9 @@ Patched:
    track 锁定为当前实际窗口尺寸，修复 resizable(False) 窗口被 Windows
    每次拖动强制撑宽的问题。
 3. on_ready 回调 + <<ChromeReady>> 虚拟事件：attach 全部完成（标题栏已
-   移除、尺寸已校正）后再晚一帧触发，用户此刻 reposition/deiconify 窗口
-   不会有原生标题栏闪现——即内建的 ready-to-show 钩子。
+   移除、尺寸已校正）后再延时约 120ms 触发（等 refresh/NCCALCSIZE/DWM
+   首帧合成全部落地），用户此刻 reposition/deiconify 窗口看到的即是成品——
+   内建的 ready-to-show 钩子。
 """
 from __future__ import annotations
 import sys
@@ -28,6 +29,8 @@ class WindowChrome:
         self.close_action=on_close or getattr(root,'close',root.destroy)
         self.on_ready=on_ready
         self._ready_job=None
+        self._ready_armed=False
+        self._size_settled=False
         self.attached=False
         self._old_proc=None
         self._cache_job=None
@@ -148,11 +151,14 @@ class WindowChrome:
             pass
         self.install_resize_handles()
         self.schedule_cache()
-        # PATCH(3): ready-to-show 钩子。attach 已全部完成（标题栏移除、
-        # 尺寸校正、_fixed_size 已存），再晚一帧让 NCCALCSIZE 等消息落地，
-        # 然后回调 + 虚拟事件——用户此刻 reposition/deiconify 窗口，
-        # 看到的是成品，无原生标题栏闪现。
-        self._ready_job=self.root.after_idle(self._fire_ready)
+        # PATCH(3): ready-to-show 钩子，事件驱动而非定时猜测：
+        # 等"客户端尺寸落到 _fixed_size 的那组 WM_SIZE"——它是
+        # NCCALCSIZE 重排全部落地的精确信号（见 window_proc 置标志），
+        # 由随后的 refresh_cache（跑在 idle，Tcl 安全）接管触发。
+        # 300ms 兜底仅防御极端情况（正常路径 WM_SIZE 必到）。
+        self._ready_armed=True
+        self._size_settled=False
+        self._ready_job=self.root.after(300,self._fire_ready)
 
     def _fire_ready(self):
         self._ready_job=None
@@ -219,6 +225,12 @@ class WindowChrome:
 
     def window_proc(self,hwnd,message,wparam,lparam):
         try:
+            if message==0x0005 and self._ready_armed and wparam==0:  # WM_SIZE/SIZE_RESTORED
+                # 客户端尺寸落到请求值 = 重排全部落地的信号。只置标志：
+                # window_proc 不重入 Tcl，由随后的 refresh_cache 接管触发
+                if self._fixed_size is not None and \
+                   (lparam&0xffff,(lparam>>16)&0xffff)==self._fixed_size:
+                    self._size_settled=True
             if message==0x0231:  # WM_ENTERSIZEMOVE
                 self._native_moving=True;self._system_move_pending=False
                 self.system_move_count+=1
@@ -304,6 +316,15 @@ class WindowChrome:
     def refresh_cache(self):
         self._cache_job=None
         if not self.attached:return
+        if self._ready_armed and self._size_settled:
+            # 尺寸消息已落地，且事件队列已抽空（refresh 本身跑在 idle）：
+            # 这就是"真 ready"时刻——取消兜底定时，一帧后回调
+            self._ready_armed=False
+            if self._ready_job is not None:
+                try:self.root.after_cancel(self._ready_job)
+                except tk.TclError:pass
+                self._ready_job=None
+            self._ready_job=self.root.after_idle(self._fire_ready)
         self.resize_margin=max(5,round(self.root.winfo_fpixels('1i')/96*5))
         self.layout_resize_handles()
         def rect(widget):
