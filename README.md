@@ -74,3 +74,10 @@ python spore_trainer.py
 - 《孢子》（Spore）及所有相关素材的版权归 Electronic Arts 所有，本工具与 EA / Maxis 无任何关联，未获得其授权或认可。
 
 **最后：** 这个修改器的初衷，是让一个五岁半的孩子在太空里不被打爆、尽情探索。愿每位家长都能陪孩子玩得尽兴——这比任何数值都重要。
+**如何找到地球呢？** 
+保持和我相同的视角。找图中的三叉戟。
+<img width="1477" height="854" alt="howtofindearth" src="https://github.com/user-attachments/assets/6ca17c12-5781-411e-85bb-589de74305f5" />
+三叉戟附近有三颗很亮的星系。他附近就是太阳系了名字是sol！！！
+<img width="1477" height="854" alt="sol" src="https://github.com/user-attachments/assets/4aefd599-af6d-42fd-9601-4f0f78f33a99" />
+
+
