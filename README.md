@@ -79,5 +79,8 @@ python spore_trainer.py
 <img width="1477" height="854" alt="howtofindearth" src="https://github.com/user-attachments/assets/6ca17c12-5781-411e-85bb-589de74305f5" />
 三叉戟附近有三颗很亮的星系。他附近就是太阳系了名字是sol！！！
 <img width="1477" height="854" alt="sol" src="https://github.com/user-attachments/assets/4aefd599-af6d-42fd-9601-4f0f78f33a99" />
+里面就是地球
+<img width="1920" height="1107" alt="image" src="https://github.com/user-attachments/assets/73e847df-f055-48cd-b03e-7f4b73b72ee9" />
+
 
 
