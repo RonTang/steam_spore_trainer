@@ -30,9 +30,12 @@ CHAINS = {
     "能量": dict(module_offset=0x12DBA14,
                  offsets=(0x40, 0x12C, 0xF8, 0x8, 0x54),
                  is_float=True,  delta=0x2B4, lockable=True),
-    "金钱": dict(module_offset=0x12DBA14,
-                 offsets=(0x40, 0xC, 0x0, 0x84, 0xD0),
-                 is_float=False, delta=0, lockable=True),
+    #"金钱": dict(module_offset=0x12DBA14,
+    #             offsets=(0x40, 0xC, 0x0, 0x84, 0xD0),
+    #             is_float=False, delta=0, lockable=True),
+    "金钱": dict(module_offset=0x127EB44,
+                 offsets=(0x88, 0x28, 0x1EC, 0xD0),
+                 is_float=False, delta=0, lockable=True)
     # 修改：航程（不需要锁定）
     "航程": dict(module_offset=0x12DC0FC,
                  offsets=(0x5C, 0x30, 0x34, 0x3C, 0x1CC),
